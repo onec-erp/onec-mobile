@@ -4,13 +4,16 @@
 // Covered: text / number / boolean / enum / ref / date / secret + catalog
 // code+description. Not yet: tabular sections (shown as a notice).
 
-import React, { createContext, useContext, useMemo, useState } from 'react';
-import { ActivityIndicator, FlatList, Modal, Pressable, Switch, Text, TextInput, View } from 'react-native';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Pressable, Switch, Text, TextInput, View } from 'react-native';
+import { BottomSheetBackdrop, BottomSheetFlatList, BottomSheetModal, BottomSheetTextInput, type BottomSheetBackdropProps } from '@gorhom/bottom-sheet';
 import type { Row } from '../../api/onecClient';
-import { colors, type ThemeColors } from '../theme';
+import { colors, isDark, type ThemeColors } from '../theme';
 import type { CustomRenderer, DivHost } from '../types';
-import { GeoField } from './geo';
+import { GeoField, MapEditor } from './geo';
+import { LucideIcon } from './lucide';
 import { FileField, GalleryField, ImageField } from './media';
+import { Touchable } from '../../ui/touchable';
 
 type Attr = Record<string, any>;
 const NUMERIC = new Set(['BigDecimal', 'Integer', 'Long', 'Double', 'Float', 'Short', 'int', 'long', 'double']);
@@ -61,6 +64,10 @@ function OnecForm({ form, host }: { form: Record<string, any>; host: DivHost }) 
               if (a.secret === true) continue;
               const col = a.columnName ?? a.fieldName;
               if (r[col] != null) row[a.fieldName] = r[col];
+              // Carry the server-resolved ref label (`{col}_display`) so the picker shows the name,
+              // not the stored uuid. Ignored by payload() (it only reads each attr's fieldName).
+              const disp = r[`${col}_display`];
+              if (disp != null) row[`${a.fieldName}_display`] = disp;
             }
             return row;
           })
@@ -82,7 +89,9 @@ function OnecForm({ form, host }: { form: Record<string, any>; host: DivHost }) 
     });
   };
 
-  const addRow = (section: string) => setSections((p) => ({ ...p, [section]: [...(p[section] ?? []), {}] }));
+  // New rows go to the top so the tap has an immediately-visible result (the old append
+  // dropped the row at the bottom, often off-screen — which read as "nothing happened").
+  const addRow = (section: string) => setSections((p) => ({ ...p, [section]: [{}, ...(p[section] ?? [])] }));
   const removeRow = (section: string, idx: number) =>
     setSections((p) => ({ ...p, [section]: (p[section] ?? []).filter((_, i) => i !== idx) }));
   const setCell = (section: string, idx: number, key: string, value: unknown) =>
@@ -158,6 +167,14 @@ function OnecForm({ form, host }: { form: Record<string, any>; host: DivHost }) 
     }
   }
 
+  // Leave without saving. The form lives at its own route (…/{id}/edit or …/new),
+  // so refresh() would just reload the form — i.e. look dead. Navigate away instead:
+  // edit → back to the record's detail, create/duplicate → back to the list.
+  function cancel() {
+    if (isEdit && id != null) host.fire(`onec://${kind}/${name}/${id}`);
+    else host.fire(`onec://${kind}/${name}`);
+  }
+
   return (
     <ThemeC.Provider value={c}>
       <View>
@@ -175,7 +192,7 @@ function OnecForm({ form, host }: { form: Record<string, any>; host: DivHost }) 
         )}
 
         {attributes.map((a) => (
-          <FieldControl key={a.fieldName} attr={a} value={values[a.fieldName]} error={errors[a.fieldName]} onChange={(v) => set(a.fieldName, v)} host={host} />
+          <FieldControl key={a.fieldName} attr={a} value={values[a.fieldName]} display0={str(initial[`${a.columnName ?? a.fieldName}_display`])} error={errors[a.fieldName]} onChange={(v) => set(a.fieldName, v)} host={host} />
         ))}
 
         {tabularSections.map((ts) => (
@@ -192,12 +209,12 @@ function OnecForm({ form, host }: { form: Record<string, any>; host: DivHost }) 
 
         {notice ? <Text style={{ color: c.dangerFg, fontSize: 12, marginTop: 8 }}>{notice}</Text> : null}
 
-        <Pressable style={{ backgroundColor: c.accentBg, borderRadius: 8, paddingVertical: 14, alignItems: 'center', marginTop: 20, opacity: saving ? 0.6 : 1 }} disabled={saving} onPress={submit}>
+        <Touchable style={{ backgroundColor: c.accentBg, borderRadius: 8, paddingVertical: 14, alignItems: 'center', marginTop: 20, opacity: saving ? 0.6 : 1 }} disabled={saving} onPress={submit}>
           {saving ? <ActivityIndicator color={c.accentFg} /> : <Text style={{ color: c.accentFg, fontWeight: '700', fontSize: 15 }}>{form.submitLabel ?? 'Save'}</Text>}
-        </Pressable>
-        <Pressable style={{ paddingVertical: 12, alignItems: 'center', marginTop: 8 }} disabled={saving} onPress={() => host.refresh()}>
+        </Touchable>
+        <Touchable style={{ paddingVertical: 12, alignItems: 'center', marginTop: 8 }} disabled={saving} onPress={cancel}>
           <Text style={{ color: c.muted, fontWeight: '600' }}>Cancel</Text>
-        </Pressable>
+        </Touchable>
       </View>
     </ThemeC.Provider>
   );
@@ -205,7 +222,8 @@ function OnecForm({ form, host }: { form: Record<string, any>; host: DivHost }) 
 
 // An editable grid for one tabular section: add/remove rows, each cell rendered by the same
 // FieldControl the top-level fields use. On mobile each row is a stacked card (not a wide
-// spreadsheet line) so ref pickers, enums and dates stay tappable.
+// spreadsheet line) so ref pickers, enums and dates stay tappable. New rows land on top and
+// briefly flash, so adding one is obviously felt.
 function SectionEditor({
   section,
   rows,
@@ -222,35 +240,81 @@ function SectionEditor({
   onCell: (idx: number, key: string, value: unknown) => void;
 }) {
   const c = useContext(ThemeC);
+  const press = isDark(c) ? '#262626' : '#F3F4F6';
   const columns: Attr[] = ((section.attributes as Attr[]) ?? [])
     .filter((a) => a.visibleInForm !== false)
     .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
   const title = (section.label as string) ?? (section.name ? section.name.charAt(0).toUpperCase() + section.name.slice(1) : 'Rows');
 
+  // Flash the just-added (top) row so the add reads as a clear, located change.
+  const [flashing, setFlashing] = useState(false);
+  const add = () => {
+    onAdd();
+    setFlashing(true);
+    setTimeout(() => setFlashing(false), 1100);
+  };
+
+  const AddBtn = ({ label }: { label: string }) => (
+    <Pressable
+      onPress={add}
+      android_ripple={{ color: press }}
+      style={({ pressed }) => ({ flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 8, borderWidth: 1, borderColor: c.border, backgroundColor: pressed ? press : 'transparent' })}
+    >
+      <LucideIcon name="plus" size={15} color={c.primary} />
+      <Text style={{ color: c.primary, fontWeight: '600', fontSize: 13 }}>{label}</Text>
+    </Pressable>
+  );
+
   return (
-    <View style={{ marginTop: 16, borderWidth: 1, borderColor: c.border, borderRadius: 12, padding: 12, backgroundColor: c.card }}>
+    <View style={{ marginTop: 16, borderWidth: 1, borderColor: c.border, borderRadius: 14, padding: 12, backgroundColor: c.card }}>
       <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-        <Text style={{ fontSize: 15, fontWeight: '700', color: c.text }}>{title}</Text>
-        <Pressable onPress={onAdd} style={{ paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, borderWidth: 1, borderColor: c.border }}>
-          <Text style={{ color: c.primary, fontWeight: '600', fontSize: 13 }}>+ Add row</Text>
-        </Pressable>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 1 }}>
+          <Text style={{ fontSize: 15, fontWeight: '700', color: c.text }} numberOfLines={1}>{title}</Text>
+          {rows.length > 0 ? (
+            <View style={{ minWidth: 22, paddingHorizontal: 7, paddingVertical: 2, borderRadius: 10, backgroundColor: c.surface }}>
+              <Text style={{ fontSize: 12, fontWeight: '600', color: c.muted }}>{rows.length}</Text>
+            </View>
+          ) : null}
+        </View>
+        <AddBtn label="Add row" />
       </View>
       {rows.length === 0 ? (
-        <Text style={{ color: c.muted, fontSize: 13 }}>No rows yet.</Text>
+        <View style={{ alignItems: 'center', gap: 10, paddingVertical: 16 }}>
+          <Text style={{ color: c.muted, fontSize: 13 }}>No rows yet.</Text>
+          <AddBtn label="Add the first row" />
+        </View>
       ) : (
-        rows.map((row, idx) => (
-          <View key={idx} style={{ backgroundColor: c.surface, borderWidth: 1, borderColor: c.border, borderRadius: 10, padding: 10, marginTop: 8 }}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-              <Text style={{ fontSize: 12, fontWeight: '600', color: c.muted }}>{`Row ${idx + 1}`}</Text>
-              <Pressable onPress={() => onRemove(idx)} hitSlop={6}>
-                <Text style={{ color: c.dangerFg, fontSize: 13, fontWeight: '600' }}>Remove</Text>
-              </Pressable>
+        rows.map((row, idx) => {
+          const flash = idx === 0 && flashing;
+          return (
+            <View
+              key={idx}
+              style={{
+                backgroundColor: flash ? c.successBg : c.surface,
+                borderWidth: 1,
+                borderColor: flash ? c.successFg : c.border,
+                borderRadius: 12,
+                padding: 12,
+                marginTop: 8,
+              }}
+            >
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 2 }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', color: c.muted, letterSpacing: 0.4 }}>{`ROW ${idx + 1}`}</Text>
+                <Pressable
+                  onPress={() => onRemove(idx)}
+                  hitSlop={8}
+                  style={({ pressed }) => ({ flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 8, backgroundColor: pressed ? c.dangerBg : 'transparent' })}
+                >
+                  <LucideIcon name="trash-2" size={15} color={c.dangerFg} />
+                  <Text style={{ color: c.dangerFg, fontSize: 13, fontWeight: '600' }}>Remove</Text>
+                </Pressable>
+              </View>
+              {columns.map((a) => (
+                <FieldControl key={a.fieldName} attr={a} value={row[a.fieldName]} display0={str(row[`${a.fieldName}_display`])} onChange={(v) => onCell(idx, a.fieldName, v)} host={host} />
+              ))}
             </View>
-            {columns.map((a) => (
-              <FieldControl key={a.fieldName} attr={a} value={row[a.fieldName]} onChange={(v) => onCell(idx, a.fieldName, v)} host={host} />
-            ))}
-          </View>
-        ))
+          );
+        })
       )}
     </View>
   );
@@ -267,7 +331,21 @@ function Input(props: React.ComponentProps<typeof TextInput>) {
   );
 }
 
-function FieldControl({ attr, value, error, onChange, host }: { attr: Attr; value: unknown; error?: string; onChange: (v: unknown) => void; host: DivHost }) {
+// A real checkbox that owns its label — the default for boolean fields (a Switch is opt-in
+// via .widget("switch"/"toggle")). Tapping the whole row toggles it.
+function Checkbox({ value, onChange, label }: { value: boolean; onChange: (v: boolean) => void; label: string }) {
+  const c = useContext(ThemeC);
+  return (
+    <Touchable onPress={() => onChange(!value)} hitSlop={6} style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 8 }}>
+      <View style={{ width: 22, height: 22, borderRadius: 6, borderWidth: 2, borderColor: value ? c.primary : c.fieldBorder, backgroundColor: value ? c.primary : 'transparent', alignItems: 'center', justifyContent: 'center' }}>
+        {value ? <LucideIcon name="check" size={15} color="#fff" /> : null}
+      </View>
+      <Text style={{ fontSize: 14, color: c.text, flex: 1 }}>{label}</Text>
+    </Touchable>
+  );
+}
+
+function FieldControl({ attr, value, error, onChange, host, display0 }: { attr: Attr; value: unknown; error?: string; onChange: (v: unknown) => void; host: DivHost; display0?: string }) {
   const c = useContext(ThemeC);
   const label = (attr.displayName as string) ?? attr.fieldName;
   const required = attr.required === true;
@@ -285,10 +363,17 @@ function FieldControl({ attr, value, error, onChange, host }: { attr: Attr; valu
   const widget = ((attr.widget as string) ?? '').toLowerCase();
   const str0 = value == null ? undefined : String(value);
   const onStr = (v: string) => onChange(v === '' ? null : v);
+  if (/^geojson$/.test(widget)) {
+    return (
+      <Field label={label} required={required} error={error}>
+        <MapEditor value={str0} onChange={onStr} theme={host.theme} lockScroll={host.lockScroll} />
+      </Field>
+    );
+  }
   if (/^(map|geo|geolocation)$/.test(widget)) {
     return (
       <Field label={label} required={required} error={error}>
-        <GeoField value={str0} onChange={onStr} theme={host.theme} />
+        <GeoField value={str0} onChange={onStr} theme={host.theme} lockScroll={host.lockScroll} />
       </Field>
     );
   }
@@ -313,16 +398,31 @@ function FieldControl({ attr, value, error, onChange, host }: { attr: Attr; valu
       </Field>
     );
   }
-  if (attr.isRef === true) return <RefField attr={attr} value={value} error={error} onChange={onChange} host={host} label={label} required={required} />;
+  if (attr.isRef === true) return <RefField attr={attr} value={value} error={error} onChange={onChange} host={host} label={label} required={required} initialDisplay={display0} />;
   if (attr.isEnum === true) {
-    const options: string[] = ((attr.enumValues as Attr[]) ?? []).map((e) => e.name).filter(Boolean);
+    // Respect a configured display label (displayName/label) but store the raw enum name.
+    const options: EnumOption[] = ((attr.enumValues as Attr[]) ?? [])
+      .filter((e) => e?.name)
+      .map((e) => ({ value: String(e.name), label: String(e.displayName ?? e.label ?? e.name) }));
     return <EnumField label={label} required={required} error={error} value={str(value)} options={options} onChange={onChange} />;
   }
   if (javaType === 'boolean' || javaType === 'Boolean') {
+    // A settings-style switch only when hinted; otherwise a plain checkbox (mirrors the web).
+    if (/^(switch|toggle)$/.test(widget)) {
+      return (
+        <View style={{ marginVertical: 6 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <Text style={{ fontSize: 14, color: c.text, fontWeight: '500', flex: 1 }}>{label}</Text>
+            <Switch value={value === true} onValueChange={onChange} />
+          </View>
+          {error ? <Text style={{ color: c.dangerFg, fontSize: 12, marginTop: 4 }}>{error}</Text> : null}
+        </View>
+      );
+    }
     return (
-      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginVertical: 8 }}>
-        <Text style={{ fontSize: 13, color: c.text, fontWeight: '500' }}>{label}</Text>
-        <Switch value={value === true} onValueChange={onChange} />
+      <View style={{ marginVertical: 6 }}>
+        <Checkbox value={value === true} onChange={onChange} label={label} />
+        {error ? <Text style={{ color: c.dangerFg, fontSize: 12, marginTop: 2 }}>{error}</Text> : null}
       </View>
     );
   }
@@ -334,13 +434,63 @@ function FieldControl({ attr, value, error, onChange, host }: { attr: Attr; valu
   );
 }
 
-function RefField({ attr, value, error, onChange, host, label, required }: { attr: Attr; value: unknown; error?: string; onChange: (v: unknown) => void; host: DivHost; label: string; required: boolean }) {
+// The configured representation of a ref row: prefer the description/name, fall back to
+// code/number/id — mirrors the web's `displayOf`, so the picker shows the name when the
+// catalog is set up to display by name (not its internal code).
+function refDisplay(r: Row): string {
+  const desc = r._description;
+  if (desc != null && String(desc).trim() !== '') return String(desc);
+  return String(r._code ?? r._number ?? r.name ?? r._id ?? '');
+}
+// A muted secondary line (the code) shown under the name when it adds information.
+function refSecondary(r: Row, primary: string): string | undefined {
+  const code = r._code != null && String(r._code).trim() !== '' ? String(r._code) : '';
+  return code && code !== primary ? code : undefined;
+}
+
+type EnumOption = { value: string; label: string };
+type PickerRow = { id: string; label: string; sub?: string };
+
+// The tappable field control that opens a Picker — shared by ref + enum so they look alike.
+// Shows the resolved display, a chevron affordance, and a clear (×) for optional fields.
+function SelectTrigger({ display, placeholder, onPress, onClear }: { display?: string; placeholder: string; onPress: () => void; onClear?: () => void }) {
   const c = useContext(ThemeC);
+  const press = isDark(c) ? '#262626' : '#F3F4F6';
+  const has = !!display;
+  return (
+    <Pressable
+      onPress={onPress}
+      android_ripple={{ color: press }}
+      style={({ pressed }) => ({
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 8,
+        borderWidth: 1,
+        borderColor: c.fieldBorder,
+        borderRadius: 10,
+        paddingHorizontal: 12,
+        minHeight: 46,
+        backgroundColor: pressed ? press : c.fieldBg,
+      })}
+    >
+      <Text style={{ flex: 1, fontSize: 15, color: has ? c.text : c.muted }} numberOfLines={1}>{has ? display : placeholder}</Text>
+      {has && onClear ? (
+        <Touchable onPress={onClear} hitSlop={10} style={{ padding: 2 }}>
+          <LucideIcon name="x" size={16} color={c.muted} />
+        </Touchable>
+      ) : null}
+      <LucideIcon name="chevrons-up-down" size={16} color={c.muted} />
+    </Pressable>
+  );
+}
+
+function RefField({ attr, value, error, onChange, host, label, required, initialDisplay }: { attr: Attr; value: unknown; error?: string; onChange: (v: unknown) => void; host: DivHost; label: string; required: boolean; initialDisplay?: string }) {
   const refKind = (attr.refKind ?? 'catalog') === 'document' ? 'documents' : 'catalogs';
   const target = (attr.refTarget as string) ?? '';
   const [open, setOpen] = useState(false);
   const [rows, setRows] = useState<Row[]>([]);
-  const [display, setDisplay] = useState(str(attr.__display));
+  // Seed from the server-resolved label so an existing ref shows its name (not the stored uuid).
+  const [display, setDisplay] = useState(initialDisplay || str(attr.__display));
   const [loading, setLoading] = useState(false);
 
   async function search(q: string) {
@@ -354,70 +504,139 @@ function RefField({ attr, value, error, onChange, host, label, required }: { att
     }
   }
 
+  const shown = display || (value != null ? String(value) : undefined);
   return (
     <Field label={label} required={required} error={error}>
-      <Pressable
-        style={{ borderWidth: 1, borderColor: c.fieldBorder, borderRadius: 8, paddingHorizontal: 12, minHeight: 44, justifyContent: 'center', backgroundColor: c.fieldBg }}
+      <SelectTrigger
+        display={shown}
+        placeholder={`Select ${target || 'value'}…`}
         onPress={() => { setOpen(true); search(''); }}
-      >
-        <Text style={{ color: display || value ? c.text : c.muted }}>{display || (value ? String(value) : 'Select…')}</Text>
-      </Pressable>
+        onClear={required ? undefined : () => { onChange(null); setDisplay(''); }}
+      />
       <Picker
         open={open}
         loading={loading}
         title={`Select ${target}`}
+        selectedId={value != null ? String(value) : undefined}
         onClose={() => setOpen(false)}
         onSearch={search}
-        rows={rows.map((r) => ({ id: String(r._id), label: String(r._code ?? r._description ?? r.name ?? r._id) }))}
+        rows={rows.map((r) => {
+          const lbl = refDisplay(r);
+          return { id: String(r._id), label: lbl, sub: refSecondary(r, lbl) };
+        })}
         onPick={(opt) => { onChange(opt.id); setDisplay(opt.label); setOpen(false); }}
       />
     </Field>
   );
 }
 
-function EnumField({ label, required, error, value, options, onChange }: { label: string; required: boolean; error?: string; value: string; options: string[]; onChange: (v: unknown) => void }) {
-  const c = useContext(ThemeC);
+function EnumField({ label, required, error, value, options, onChange }: { label: string; required: boolean; error?: string; value: string; options: EnumOption[]; onChange: (v: unknown) => void }) {
   const [open, setOpen] = useState(false);
+  const selected = options.find((o) => o.value === value);
   return (
     <Field label={label} required={required} error={error}>
-      <Pressable style={{ borderWidth: 1, borderColor: c.fieldBorder, borderRadius: 8, paddingHorizontal: 12, minHeight: 44, justifyContent: 'center', backgroundColor: c.fieldBg }} onPress={() => setOpen(true)}>
-        <Text style={{ color: value ? c.text : c.muted }}>{value || '—'}</Text>
-      </Pressable>
-      <Picker open={open} title={label} onClose={() => setOpen(false)} rows={[{ id: '', label: '—' }, ...options.map((o) => ({ id: o, label: o }))]} onPick={(opt) => { onChange(opt.id || null); setOpen(false); }} />
+      <SelectTrigger
+        display={selected?.label || value || undefined}
+        placeholder="Select…"
+        onPress={() => setOpen(true)}
+        onClear={required ? undefined : () => onChange(null)}
+      />
+      <Picker
+        open={open}
+        title={label}
+        selectedId={value || ''}
+        onClose={() => setOpen(false)}
+        rows={[{ id: '', label: '—' }, ...options.map((o) => ({ id: o.value, label: o.label }))]}
+        onPick={(opt) => { onChange(opt.id || null); setOpen(false); }}
+      />
     </Field>
   );
 }
 
-function Picker({ open, title, rows, onPick, onClose, onSearch, loading }: {
-  open: boolean; title: string; rows: { id: string; label: string }[]; onPick: (o: { id: string; label: string }) => void; onClose: () => void; onSearch?: (q: string) => void; loading?: boolean;
+// A bottom-sheet picker on @gorhom/bottom-sheet: drag handle, animated backdrop, optional
+// server-search box, and a result list whose rows show the display label (+ a muted secondary)
+// and a check on the current value. `open` is the source of truth — it drives present/dismiss.
+function Picker({ open, title, rows, onPick, onClose, onSearch, loading, selectedId }: {
+  open: boolean; title: string; rows: PickerRow[]; onPick: (o: PickerRow) => void; onClose: () => void; onSearch?: (q: string) => void; loading?: boolean; selectedId?: string;
 }) {
   const c = useContext(ThemeC);
-  return (
-    <Modal visible={open} animationType="slide" transparent onRequestClose={onClose}>
-      <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end' }}>
-        <View style={{ backgroundColor: c.card, borderTopLeftRadius: 16, borderTopRightRadius: 16, paddingBottom: 24 }}>
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, borderBottomWidth: 1, borderBottomColor: c.border }}>
-            <Text style={{ fontSize: 16, fontWeight: '700', color: c.text }}>{title}</Text>
-            <Pressable onPress={onClose}><Text style={{ color: c.primary, fontWeight: '600' }}>Close</Text></Pressable>
+  const press = isDark(c) ? '#262626' : '#F3F4F6';
+  const ref = useRef<BottomSheetModal>(null);
+  const snapPoints = useMemo(() => ['55%', '90%'], []);
+
+  useEffect(() => {
+    if (open) ref.current?.present();
+    else ref.current?.dismiss();
+  }, [open]);
+
+  const renderBackdrop = useCallback(
+    (props: BottomSheetBackdropProps) => (
+      <BottomSheetBackdrop {...props} appearsOnIndex={0} disappearsOnIndex={-1} pressBehavior="close" opacity={0.45} />
+    ),
+    [],
+  );
+
+  const renderItem = useCallback(
+    ({ item }: { item: PickerRow }) => {
+      const sel = selectedId != null && item.id === selectedId;
+      return (
+        <Touchable
+          onPress={() => onPick(item)}
+          dim={1}
+          style={({ pressed }) => ({ flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 16, paddingVertical: 13, backgroundColor: pressed ? press : 'transparent' })}
+        >
+          <View style={{ flex: 1 }}>
+            <Text style={{ fontSize: 15, color: c.text, fontWeight: sel ? '600' : '400' }} numberOfLines={1}>{item.label}</Text>
+            {item.sub ? <Text style={{ fontSize: 12, color: c.muted, marginTop: 1 }} numberOfLines={1}>{item.sub}</Text> : null}
           </View>
-          {onSearch && <Input placeholder="Search…" style={{ margin: 12 }} onChangeText={onSearch} autoFocus />}
-          {loading ? (
-            <ActivityIndicator style={{ marginVertical: 24 }} color={c.text} />
-          ) : (
-            <FlatList
-              data={rows}
-              keyExtractor={(it, i) => it.id + i}
-              renderItem={({ item }) => (
-                <Pressable style={{ paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: c.border }} onPress={() => onPick(item)}>
-                  <Text style={{ fontSize: 15, color: c.text }}>{item.label}</Text>
-                </Pressable>
-              )}
-              style={{ maxHeight: 360 }}
-            />
-          )}
+          {sel ? <LucideIcon name="check" size={18} color={c.primary} /> : null}
+        </Touchable>
+      );
+    },
+    [c, press, selectedId, onPick],
+  );
+
+  return (
+    <BottomSheetModal
+      ref={ref}
+      index={onSearch ? 1 : 0}
+      snapPoints={snapPoints}
+      enableDynamicSizing={false}
+      onDismiss={onClose}
+      backdropComponent={renderBackdrop}
+      backgroundStyle={{ backgroundColor: c.card }}
+      handleIndicatorStyle={{ backgroundColor: c.border, width: 40 }}
+      keyboardBehavior="interactive"
+      keyboardBlurBehavior="restore"
+      android_keyboardInputMode="adjustResize"
+    >
+      <View style={{ flex: 1 }}>
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingBottom: 8 }}>
+          <Text style={{ fontSize: 16, fontWeight: '700', color: c.text, flex: 1 }} numberOfLines={1}>{title}</Text>
+          <Touchable onPress={onClose} hitSlop={8}><Text style={{ color: c.primary, fontWeight: '600', fontSize: 15 }}>Done</Text></Touchable>
         </View>
+        {onSearch && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, borderWidth: 1, borderColor: c.fieldBorder, borderRadius: 10, paddingHorizontal: 10, height: 42, backgroundColor: c.fieldBg, marginHorizontal: 16, marginBottom: 6 }}>
+            <LucideIcon name="search" size={16} color={c.muted} />
+            <BottomSheetTextInput placeholder="Search…" placeholderTextColor={c.muted} style={{ flex: 1, fontSize: 15, color: c.text, paddingVertical: 0 }} onChangeText={onSearch} />
+          </View>
+        )}
+        {loading ? (
+          <ActivityIndicator style={{ marginVertical: 28 }} color={c.text} />
+        ) : rows.length === 0 ? (
+          <Text style={{ textAlign: 'center', color: c.muted, fontSize: 14, paddingVertical: 28 }}>No matches</Text>
+        ) : (
+          <BottomSheetFlatList
+            data={rows}
+            keyExtractor={(it, i) => it.id + i}
+            keyboardShouldPersistTaps="handled"
+            renderItem={renderItem}
+            style={{ flex: 1 }}
+            contentContainerStyle={{ paddingBottom: 24 }}
+          />
+        )}
       </View>
-    </Modal>
+    </BottomSheetModal>
   );
 }
 

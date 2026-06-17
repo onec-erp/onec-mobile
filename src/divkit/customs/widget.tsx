@@ -4,8 +4,8 @@
 // rendered natively: list / stat / sparkline / gauge / chart (bar/line/area/
 // donut/pie) / kanban / calendar.
 
-import React, { useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, Text, View } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { ActivityIndicator, ScrollView, Text, View } from 'react-native';
 import type { Row } from '../../api/onecClient';
 import {
   formatAmount,
@@ -20,6 +20,7 @@ import {
 } from '../format';
 import { colors, type ThemeColors } from '../theme';
 import type { CustomRenderer, DivHost } from '../types';
+import { useLiveRefresh } from '../useLiveRefresh';
 import {
   aggregate,
   buildSeries,
@@ -30,33 +31,46 @@ import {
   type Metric,
 } from '../widgetData';
 import { GaugeView, Legend, PieChartView, resolveColor, resolveColors, Sparkline, XYChart } from '../charts';
+import { GeoMap, geoSourceFrom, hasGeoSource, shapesFromRow, type GeoShape } from './geo';
+import { HintGlyph } from './icon';
 import { LucideIcon } from './lucide';
+import { Touchable } from '../../ui/touchable';
 
 // ----- shared shell -----
 
 function useRows(host: DivHost, meta: WidgetMeta) {
-  const [state, setState] = useState<{ rows: Row[] | null; error: string | null }>({ rows: null, error: null });
-  useEffect(() => {
+  const isRegister = meta.entityType === 'register';
+  const kind = isRegister ? 'registers' : meta.kind;
+  const opts = isRegister
+    ? { registerPath: 'turnover', from: '1970-01-01T00:00:00', to: '2999-12-31T23:59:59' }
+    : {};
+  // Seed from cache so a revisited widget paints its last data immediately (no
+  // loading flash); the effect then revalidates in the background.
+  const [state, setState] = useState<{ rows: Row[] | null; error: string | null }>(() => ({
+    rows: host.client.peekRows(kind, meta.entityName, opts) ?? null,
+    error: null,
+  }));
+  const reload = useCallback(() => {
     let alive = true;
-    (async () => {
-      try {
-        const rows =
-          meta.entityType === 'register'
-            ? await host.client.rows('registers', meta.entityName, {
-                registerPath: 'turnover',
-                from: '1970-01-01T00:00:00',
-                to: '2999-12-31T23:59:59',
-              })
-            : await host.client.rows(meta.kind, meta.entityName);
-        if (alive) setState({ rows, error: null });
-      } catch (e: any) {
-        if (alive) setState({ rows: null, error: String(e?.message ?? e) });
-      }
-    })();
+    host.client
+      .rows(kind, meta.entityName, opts)
+      .then((rows) => alive && setState({ rows, error: null }))
+      // Keep any cached rows on a background-refresh failure; only error on a cold miss.
+      .catch((e: any) => alive && setState((s) => (s.rows ? s : { rows: null, error: String(e?.message ?? e) })));
     return () => {
       alive = false;
     };
-  }, [meta.entityType, meta.entityName, meta.kind]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kind, meta.entityName, JSON.stringify(opts)]);
+  useEffect(() => {
+    // Recently fetched → trust the cache; skip the mount refetch + re-render churn.
+    if (host.client.freshRows(kind, meta.entityName, opts)) return;
+    return reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reload]);
+  // Live updates: refetch when a write to this widget's entity arrives over SSE
+  // (posting fans out a register "*" change, which matches register widgets too).
+  useLiveRefresh(kind, meta.entityName, reload);
   return state;
 }
 
@@ -83,7 +97,7 @@ function Card({
           >
             {meta.title}
           </Text>
-          {meta.hint ? <LucideIcon name="help-circle" size={13} color={c.muted} /> : null}
+          <HintGlyph text={meta.hint} c={c} size={13} />
         </View>
         {right}
       </View>
@@ -143,7 +157,7 @@ const ListWidget: CustomRenderer = ({ customProps, host }) => {
             const currency = resolveCurrency(row, meta.cfg('currencyField'), meta.cfg('currency'));
             const dateStr = row[dateField] != null ? String(row[dateField]) : null;
             return (
-              <Pressable key={i} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 8, gap: 8 }} onPress={() => openRow(host, meta, row)}>
+              <Touchable key={i} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 8, gap: 8 }} onPress={() => openRow(host, meta, row)}>
                 <View style={{ flex: 1 }}>
                   <Text style={{ fontWeight: '600', color: c.text, fontSize: 14 }} numberOfLines={1}>
                     {headline || secondary || '—'}
@@ -158,7 +172,7 @@ const ListWidget: CustomRenderer = ({ customProps, host }) => {
                   {amount != null ? <Text style={{ fontWeight: '500', color: c.text, fontSize: 13 }}>{formatAmount(amount, { currency: currency ?? undefined })}</Text> : null}
                   {dateStr ? <Text style={{ color: c.muted, fontSize: 12 }}>{formatMonthDay(dateStr) ?? ''}</Text> : null}
                 </View>
-              </Pressable>
+              </Touchable>
             );
           })}
         </View>
@@ -210,7 +224,7 @@ const StatWidget: CustomRenderer = ({ customProps, host }) => {
           )}
         </View>
         <View style={{ marginTop: 10 }}>
-          <Sparkline data={points} color={color} kind={meta.cfg('kind') === 'line' ? 'line' : 'area'} height={44} c={c} />
+          <Sparkline data={points} color={color} kind={meta.cfg('kind') === 'line' ? 'line' : 'area'} height={56} c={c} />
         </View>
         {delta != null && <Text style={{ marginTop: 4, color: c.muted, fontSize: 11 }}>vs previous {period}</Text>}
       </View>
@@ -246,7 +260,7 @@ const SparklineWidget: CustomRenderer = ({ customProps, host }) => {
 
   return (
     <Card meta={meta} c={c} mutedTitle right={rows ? <Text style={{ fontSize: 15, fontWeight: '600', color: c.text }}>{formatCompact(total, opts)}</Text> : undefined}>
-      {error ? <Empty c={c} /> : !rows ? <Loading c={c} height={40} /> : <Sparkline data={points} color={color} kind={meta.cfg('kind') === 'line' ? 'line' : 'area'} height={40} c={c} />}
+      {error ? <Empty c={c} /> : !rows ? <Loading c={c} height={48} /> : <Sparkline data={points} color={color} kind={meta.cfg('kind') === 'line' ? 'line' : 'area'} height={48} c={c} />}
     </Card>
   );
 };
@@ -311,9 +325,9 @@ const ChartWidget: CustomRenderer = ({ customProps, host }) => {
 
   let body: React.ReactNode;
   let right: React.ReactNode;
-  if (error) body = <Empty c={c} height={210} />;
-  else if (!series) body = <Loading c={c} height={210} />;
-  else if (series.rows.length === 0) body = <Empty c={c} height={210} />;
+  if (error) body = <Empty c={c} height={230} />;
+  else if (!series) body = <Loading c={c} height={230} />;
+  else if (series.rows.length === 0) body = <Empty c={c} height={230} />;
   else {
     right = <Text style={{ fontSize: 13, fontWeight: '600', color: c.text }}>{formatNumber(series.total, opts)}</Text>;
     const fmtAxis = (n: number) => formatCompact(n, opts);
@@ -419,7 +433,7 @@ function KanbanCard({ row, c, titleField, onPress }: { row: Row; c: ThemeColors;
   const dateStr = typeof row._date === 'string' ? row._date : null;
   const amount = typeof row.total === 'number' ? row.total : null;
   return (
-    <Pressable style={{ backgroundColor: c.card, borderWidth: 1, borderColor: c.border, borderRadius: 8, padding: 10, gap: 4 }} onPress={onPress}>
+    <Touchable style={{ backgroundColor: c.card, borderWidth: 1, borderColor: c.border, borderRadius: 8, padding: 10, gap: 4 }} onPress={onPress}>
       <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
         <Text style={{ fontSize: 10, color: c.muted, fontWeight: '600', letterSpacing: 0.5 }}>{number.toUpperCase()}</Text>
         {dateStr ? <Text style={{ fontSize: 10, color: c.muted }}>{formatMonthDay(dateStr) ?? ''}</Text> : null}
@@ -435,7 +449,7 @@ function KanbanCard({ row, c, titleField, onPress }: { row: Row; c: ThemeColors;
         </Text>
       ) : null}
       {amount != null ? <Text style={{ fontSize: 12, fontWeight: '500', color: c.text, alignSelf: 'flex-end' }}>{formatAmount(amount)}</Text> : null}
-    </Pressable>
+    </Touchable>
   );
 }
 
@@ -537,15 +551,15 @@ const CalendarWidget: CustomRenderer = ({ customProps, host }) => {
       c={c}
       right={
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-          <Pressable onPress={goToday} style={{ paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1, borderColor: c.border, borderRadius: 6 }}>
+          <Touchable onPress={goToday} style={{ paddingHorizontal: 8, paddingVertical: 3, borderWidth: 1, borderColor: c.border, borderRadius: 6 }}>
             <Text style={{ fontSize: 11, color: c.text, fontWeight: '500' }}>Today</Text>
-          </Pressable>
-          <Pressable onPress={() => goMonth(-1)} hitSlop={6} style={{ padding: 4 }}>
+          </Touchable>
+          <Touchable onPress={() => goMonth(-1)} hitSlop={6} style={{ padding: 4 }}>
             <LucideIcon name="chevron-left" size={16} color={c.muted} />
-          </Pressable>
-          <Pressable onPress={() => goMonth(1)} hitSlop={6} style={{ padding: 4 }}>
+          </Touchable>
+          <Touchable onPress={() => goMonth(1)} hitSlop={6} style={{ padding: 4 }}>
             <LucideIcon name="chevron-right" size={16} color={c.muted} />
-          </Pressable>
+          </Touchable>
         </View>
       }
     >
@@ -571,7 +585,7 @@ const CalendarWidget: CustomRenderer = ({ customProps, host }) => {
                 const isSel = key === selected;
                 const isToday = key === todayKey;
                 return (
-                  <Pressable key={i} onPress={() => setSelected(key)} style={{ flex: 1, height: 40, alignItems: 'center', justifyContent: 'center' }}>
+                  <Touchable key={i} onPress={() => setSelected(key)} style={{ flex: 1, height: 40, alignItems: 'center', justifyContent: 'center' }}>
                     <View
                       style={{
                         width: 28,
@@ -591,7 +605,7 @@ const CalendarWidget: CustomRenderer = ({ customProps, host }) => {
                         <View key={j} style={{ width: 4, height: 4, borderRadius: 2, backgroundColor: ev._posted ? c.primary : c.muted }} />
                       ))}
                     </View>
-                  </Pressable>
+                  </Touchable>
                 );
               })}
             </View>
@@ -608,7 +622,7 @@ const CalendarWidget: CustomRenderer = ({ customProps, host }) => {
                 const secondary = pickField(row, ['customer_display', 'client_display', 'property_display', '_description']);
                 const amount = toNumber(pickField(row, ['total', 'total_gross', 'amount']));
                 return (
-                  <Pressable key={i} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 7, gap: 8 }} onPress={() => openRow(host, meta, row)}>
+                  <Touchable key={i} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 7, gap: 8 }} onPress={() => openRow(host, meta, row)}>
                     <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: row._posted ? c.primary : c.muted }} />
                     <View style={{ flex: 1 }}>
                       <Text style={{ fontSize: 13, fontWeight: '600', color: c.text }} numberOfLines={1}>
@@ -621,13 +635,48 @@ const CalendarWidget: CustomRenderer = ({ customProps, host }) => {
                       ) : null}
                     </View>
                     {amount != null ? <Text style={{ fontSize: 12, fontWeight: '500', color: c.text }}>{formatAmount(amount)}</Text> : null}
-                  </Pressable>
+                  </Touchable>
                 );
               })
             )}
           </View>
         </>
       )}
+    </Card>
+  );
+};
+
+// ----- map (records plotted on a read-only map) -----
+
+const MapWidget: CustomRenderer = ({ customProps, host }) => {
+  const c = colors(host.theme);
+  const meta = new WidgetMeta((customProps.widget as Record<string, any>) ?? {});
+  const { rows, error } = useRows(host, meta);
+  const source = useMemo(() => geoSourceFrom((k) => meta.cfg(k)), [meta.raw]);
+
+  const shapes = useMemo<GeoShape[]>(() => {
+    if (!rows || !hasGeoSource(source)) return [];
+    const out: GeoShape[] = [];
+    for (const row of rows) {
+      const label = resolveText(row, { fields: splitFields(meta.titleField), fallbacks: ['_description', '_number', '_code', 'name'] });
+      const href = row._id != null ? `onec://${meta.kind}/${meta.entityName}/${row._id}` : undefined;
+      out.push(...shapesFromRow(row, source, { label, href }));
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, source, meta.titleField, meta.kind, meta.entityName]);
+
+  let body: React.ReactNode;
+  if (!hasGeoSource(source)) body = <Empty c={c} text="No geo source configured." height={200} />;
+  else if (error) body = <Empty c={c} text="Couldn’t load locations." height={200} />;
+  else if (!rows) body = <Loading c={c} height={200} />;
+  else if (shapes.length === 0) body = <Empty c={c} text="No locations yet." height={200} />;
+  else body = <GeoMap shapes={shapes} theme={host.theme} height={300} host={host} interactive />;
+
+  const markerCount = shapes.filter((s) => s.kind === 'point').length;
+  return (
+    <Card meta={meta} c={c} right={markerCount > 0 ? <Text style={{ fontSize: 13, fontWeight: '600', color: c.text }}>{markerCount}</Text> : undefined}>
+      {body}
     </Card>
   );
 };
@@ -644,6 +693,7 @@ export const onecWidget: CustomRenderer = (p) => {
     case 'chart': return <ChartWidget {...p} />;
     case 'kanban': return <KanbanWidget {...p} />;
     case 'calendar': return <CalendarWidget {...p} />;
+    case 'map': return <MapWidget {...p} />;
     default:
       return (
         <Card meta={meta} c={colors(p.host.theme)}>

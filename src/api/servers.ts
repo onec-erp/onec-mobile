@@ -27,10 +27,41 @@ const LAST_KEY = 'onec.lastServer';
 export function normalizeUrl(input: string): string | null {
   let s = (input ?? '').trim();
   if (!s) return null;
-  if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
+  // No scheme typed → default https for real hosts, http only for local/LAN dev
+  // servers (which rarely have TLS). Picking http for a remote host fails against
+  // HSTS/https-only deployments — the usual "can't connect to my server" cause.
+  if (!/^https?:\/\//i.test(s)) s = (isLocalHost(s.split(/[/:?#]/)[0]) ? 'http://' : 'https://') + s;
   // require a non-empty host after the scheme
   if (!/^https?:\/\/[^\s/?#]+/i.test(s)) return null;
   return s.replace(/\/+$/, '');
+}
+
+/** Loopback / private-LAN / *.local hosts — the ones that usually speak http. */
+function isLocalHost(host: string): boolean {
+  const h = host.toLowerCase();
+  return (
+    h === 'localhost' ||
+    h === '0.0.0.0' ||
+    h === '::1' ||
+    h.endsWith('.local') ||
+    /^127\./.test(h) ||
+    /^10\./.test(h) ||
+    /^192\.168\./.test(h) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+  );
+}
+
+/**
+ * Upgrade a remembered `http://` URL to `https://` for non-local hosts. Real
+ * deployments are TLS-only now — a stale http entry (e.g. one saved before the
+ * https default existed) just drops the connection, so the app never even reaches
+ * the login screen. Local/LAN hosts and already-https URLs are left untouched.
+ */
+export function upgradeScheme(url: string): string {
+  const m = /^http:\/\/(.+)$/i.exec(url);
+  if (!m) return url;
+  const host = m[1].split(/[/:?#]/)[0];
+  return isLocalHost(host) ? url : 'https://' + m[1];
 }
 
 /** Human label for a server: the URL minus its scheme (`localhost:8899`). */
@@ -52,10 +83,26 @@ export async function loadServers(): Promise<ServerEntry[]> {
     const raw = await AsyncStorage.getItem(SERVERS_KEY);
     const parsed = raw ? JSON.parse(raw) : null;
     if (Array.isArray(parsed)) {
-      const list = parsed
-        .filter((e) => e && typeof e.url === 'string')
-        .map((e) => entry(e.url));
-      if (list.length) return list;
+      // Migrate stale http:// remote entries to https:// and dedupe by url, then
+      // persist the cleaned list so the fix sticks across launches.
+      const seen = new Set<string>();
+      const list: ServerEntry[] = [];
+      let changed = false;
+      for (const e of parsed) {
+        if (!e || typeof e.url !== 'string') continue;
+        const url = upgradeScheme(e.url);
+        if (url !== e.url) changed = true;
+        if (seen.has(url)) {
+          changed = true;
+          continue;
+        }
+        seen.add(url);
+        list.push(entry(url));
+      }
+      if (list.length) {
+        if (changed) await saveServers(list);
+        return list;
+      }
     }
   } catch {
     /* fall through to the seed */
@@ -97,7 +144,11 @@ export async function removeServer(url: string): Promise<ServerEntry[]> {
 
 export async function getLastServer(): Promise<string | null> {
   try {
-    return await AsyncStorage.getItem(LAST_KEY);
+    const raw = await AsyncStorage.getItem(LAST_KEY);
+    if (!raw) return null;
+    const up = upgradeScheme(raw); // self-heal a stale http:// remote last-used URL
+    if (up !== raw) await setLastServer(up);
+    return up;
   } catch {
     return null;
   }

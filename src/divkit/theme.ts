@@ -32,7 +32,9 @@ const light: ThemeColors = {
   fieldBorder: '#D1D5DB',
   dangerBg: '#FEF2F2',
   dangerFg: '#B91C1C',
-  accentBg: '#111827',
+  // Primary action buttons (+New, Save, Edit, Send…) — blue like the web, not a
+  // high-contrast black/white. (accentBg is used only for these CTAs.)
+  accentBg: '#2563EB',
   accentFg: '#FFFFFF',
   successBg: '#DCFCE7',
   successFg: '#16A34A',
@@ -50,12 +52,21 @@ const dark: ThemeColors = {
   fieldBorder: '#3A3A3A',
   dangerBg: '#3A1414',
   dangerFg: '#F87171',
-  accentBg: '#EDEDED',
-  accentFg: '#121212',
+  // Primary CTAs are blue (matching the web) — in dark mode the old near-white
+  // accent made e.g. the "+New" button look like an un-themed light element.
+  accentBg: '#3B82F6',
+  accentFg: '#FFFFFF',
   successBg: '#0F2A19',
   successFg: '#4ADE80',
 };
 
 export function colors(theme: 'light' | 'dark'): ThemeColors {
   return theme === 'dark' ? dark : light;
+}
+
+/** True when the palette is the dark one (reference equality — the palettes are
+ *  singletons returned by `colors()`). Lets components pick theme-aware extras
+ *  (e.g. shadow strength) from a `ThemeColors` alone, without threading theme. */
+export function isDark(c: ThemeColors): boolean {
+  return c === dark;
 }

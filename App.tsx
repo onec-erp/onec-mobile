@@ -1,8 +1,11 @@
+import * as Haptics from 'expo-haptics';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
+  Animated,
+  AppState,
+  Linking,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -10,7 +13,12 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { OnecClient } from './src/api/onecClient';
+import Svg, { Defs, LinearGradient as SvgLinearGradient, Rect, Stop } from 'react-native-svg';
+import { OnecAuthError, OnecClient } from './src/api/onecClient';
+import { subscribeUiEvents, affectsSurface, publishUiEvent } from './src/api/events';
+import { toast, Toaster } from './src/ui/toast';
+import { confirm, ConfirmHost } from './src/ui/dialog';
+import { ContextMenuHost } from './src/ui/contextMenu';
 import {
   getLastServer,
   loadServers,
@@ -18,16 +26,45 @@ import {
   removeServer,
   type ServerEntry,
 } from './src/api/servers';
+import { getStoredTheme, setStoredTheme } from './src/api/prefs';
+import { clearCredentials, getCredentials } from './src/api/credentials';
 import { ConnectScreen } from './src/ConnectScreen';
+import { LoginScreen } from './src/LoginScreen';
 import { DivCard } from './src/divkit';
 import type { DivCardEnvelope } from './src/divkit';
 import { colors } from './src/divkit/theme';
 
-type Status = 'connecting' | 'ready' | 'error';
+type Status = 'connecting' | 'ready' | 'error' | 'login';
 type Shell = Awaited<ReturnType<OnecClient['shell']>>;
 
 const VIEWPORT = 'mobile';
 const NAV_RESERVE = 88; // height the floating bottom bar occupies
+const NAV_BOTTOM_CLEARANCE = 8; // small gap above the home indicator (the pill draws its own 12px margin on top)
+const TOP_FADE = 28; // length of the dissolve tail just below the safe area
+
+// Map a nav action url to the content path it loads, or null for side-effect
+// actions (logout / theme / post / open / SSO …) that shouldn't be prefetched.
+// Mirrors the routing in onAction — anything that isn't a plain navigation.
+function navPathFor(url: string): string | null {
+  if (!url.startsWith('onec://')) return null;
+  const rest = url.slice('onec://'.length);
+  if (
+    rest === 'logout' ||
+    rest === 'theme/toggle' ||
+    rest.startsWith('auth/sso/') ||
+    rest.startsWith('app') ||
+    rest.startsWith('delete/') ||
+    rest.startsWith('action/') ||
+    rest.startsWith('post/') ||
+    rest.startsWith('unpost/') ||
+    rest.startsWith('open/') ||
+    rest.startsWith('redirect/') ||
+    rest.startsWith('download/')
+  ) {
+    return null;
+  }
+  return ('/' + rest).replace('//', '/');
+}
 
 export default function App() {
   const insets = useSafeAreaInsets();
@@ -45,6 +82,36 @@ export default function App() {
   const [content, setContent] = useState<DivCardEnvelope | null>(null);
   const [status, setStatus] = useState<Status>('connecting');
   const [error, setError] = useState('');
+  // The server-driven login screen card (GET /api/divkit/login) — password form
+  // and/or SSO buttons, whatever this server offers. Null → the server has no
+  // such endpoint, so we fall back to the native password form.
+  const [loginCard, setLoginCard] = useState<DivCardEnvelope | null>(null);
+  // True once this server has an authenticated session — gates the live SSE stream
+  // (only opened while signed in; torn down on logout / server switch).
+  const [authed, setAuthed] = useState(false);
+  // Measured height of the floating bottom nav, so toasts sit just above it. The
+  // scroll reserve (NAV_RESERVE) is deliberately generous and double-counts the
+  // safe-area inset, so it's the wrong number for positioning the toast stack.
+  const [navHeight, setNavHeight] = useState(0);
+  // Suspends content scrolling while a child owns a pan gesture (maps), since RN's
+  // ScrollView won't otherwise yield to a JS PanResponder nested inside it.
+  const [scrollLocked, setScrollLocked] = useState(false);
+
+  // The SSE handler must reload the *current* surface with the *current* theme/profile
+  // without re-subscribing on every navigation. These refs always hold the latest.
+  const routeRef = useRef(route);
+  routeRef.current = route;
+  const reloadRef = useRef<() => void>(() => {});
+  // Monotonic id so a slow background revalidation can't clobber a newer navigation.
+  const reqSeq = useRef(0);
+
+  // Drives the top fade: hidden at rest (offset 0), fading in once content starts
+  // scrolling behind the safe area so it dissolves there rather than hard-clipping.
+  const scrollY = useRef(new Animated.Value(0)).current;
+  const topFadeOpacity = useMemo(
+    () => scrollY.interpolate({ inputRange: [0, 12], outputRange: [0, 1], extrapolate: 'clamp' }),
+    [scrollY],
+  );
 
   async function loadShell(th: 'light' | 'dark' = theme) {
     const client = clientRef.current;
@@ -56,39 +123,161 @@ export default function App() {
     }
   }
 
-  async function loadContent(path: string, th: 'light' | 'dark' = theme) {
+  async function loadContent(path: string, th: 'light' | 'dark' = theme, opts: { force?: boolean } = {}) {
+    const client = clientRef.current;
+    if (!client) return;
+    const myId = ++reqSeq.current;
+    const o = { viewport: VIEWPORT, theme: th, profile };
+    const navigating = path !== routeRef.current; // moving to a *different* screen
+    setRoute(path);
+    setError('');
+
+    // Native feel: if we've shown this screen before, paint the cached card
+    // instantly and revalidate silently; otherwise show the connecting state.
+    const cached = client.peekContent(path, o) as DivCardEnvelope | undefined;
+    if (cached) {
+      setContent(cached);
+      setStatus('ready');
+      // Recently fetched and not a forced refresh → trust the cache and skip the
+      // revalidation. This is what stops a cached revisit from re-fetching and
+      // re-rendering the whole tree (the "cached is slower than cold" problem).
+      if (!opts.force && client.freshContent(path, o)) return;
+    } else {
+      // Cold screen: drop the previous screen so the new one shows its loading
+      // state immediately. Otherwise the old screen stays on-screen until the
+      // fetch lands — which reads as "the nav tap did nothing, then it jumps".
+      // (A same-route refresh keeps its content; only navigation blanks.)
+      if (navigating) setContent(null);
+      setStatus('connecting');
+    }
+    try {
+      const env = (await client.content(path, o)) as DivCardEnvelope;
+      if (reqSeq.current === myId) {
+        setContent(env);
+        setStatus('ready');
+      }
+    } catch (e: any) {
+      // Keep the cached screen on a background-refresh failure; only surface an
+      // error on a cold miss (nothing to show).
+      if (reqSeq.current === myId && !cached) {
+        setError(String(e?.message ?? e));
+        setStatus('error');
+      }
+    }
+  }
+
+  // Always reload the live surface with the latest theme/profile/route (read off refs),
+  // so the SSE subscription can refresh without being re-created on each navigation.
+  reloadRef.current = () => loadContent(routeRef.current, theme, { force: true });
+
+  // The shareable web URL an `onec://…` navigation maps to, for the long-press
+  // "Copy link / Open in browser" menu (the mobile stand-in for right-clicking a
+  // link). Side-effect actions (logout/theme/post/delete/…) aren't links → null,
+  // so they get no menu. Reuses navPathFor, the same map the prefetcher uses.
+  function linkFor(url: string): string | null {
+    const path = navPathFor(url);
+    if (!path || !serverUrl) return null;
+    return `${serverUrl.replace(/\/$/, '')}${path}`;
+  }
+
+  // Touch-down prefetch: warm a nav destination's card the instant a finger lands,
+  // so it's usually cached by the time the tap completes. Best-effort and idempotent
+  // (skips anything already fresh); a no-op for non-navigation action urls.
+  function prefetchContent(url: string) {
+    const client = clientRef.current;
+    if (!client) return;
+    const path = navPathFor(url);
+    if (!path) return;
+    const o = { viewport: VIEWPORT, theme, profile };
+    if (client.freshContent(path, o)) return;
+    client.content(path, o).catch(() => {});
+  }
+
+  // `th` is passed explicitly so the first fetch can use a just-restored theme
+  // before the `theme` state update has applied (same reason theme/toggle does).
+  async function connect(th: 'light' | 'dark' = theme) {
     const client = clientRef.current;
     if (!client) return;
     setStatus('connecting');
-    setError('');
-    setRoute(path);
     try {
-      const env = (await client.content(path, { viewport: VIEWPORT, theme: th, profile })) as DivCardEnvelope;
-      setContent(env);
-      setStatus('ready');
+      let authedNow = (await client.me()).authenticated;
+      // No live session (the JSESSIONID cookie doesn't survive a relaunch on iOS),
+      // but we may have this server's credentials saved — replay them silently so
+      // a returning user skips the login screen.
+      if (!authedNow) {
+        const creds = await getCredentials(client.baseUrl);
+        // eslint-disable-next-line no-console
+        console.log('[auth] connect', client.baseUrl, 'savedCreds=' + !!creds);
+        if (creds) {
+          try {
+            await client.login(creds.username, creds.password);
+            authedNow = true;
+            // eslint-disable-next-line no-console
+            console.log('[auth] auto-login OK', client.baseUrl);
+          } catch (e) {
+            // Only forget the credentials when the server says they're WRONG (401).
+            // A 403 (CSRF) or any other failure is usually transient — on localhost the
+            // two servers share one cookie jar (cookies ignore the port), so switching
+            // clobbers the other's session/CSRF cookie and the first replay can 403.
+            // Wiping creds there would force a manual login on every switch; instead we
+            // keep them and just show the login screen so the next attempt can succeed.
+            const status = e instanceof OnecAuthError ? e.status : undefined;
+            // eslint-disable-next-line no-console
+            console.log('[auth] auto-login FAILED', client.baseUrl, 'status=' + status, String((e as any)?.message ?? e));
+            if (status === 401) await clearCredentials(client.baseUrl);
+          }
+        }
+      }
+      if (!authedNow) {
+        // Show the server-driven login screen — the password form and/or SSO
+        // buttons this server offers, exactly like the web. Fall back to the
+        // native password form only if the server has no /api/divkit/login.
+        try {
+          setLoginCard((await client.loginCard({ theme: th })) as DivCardEnvelope);
+        } catch {
+          setLoginCard(null);
+        }
+        setStatus('login');
+        return;
+      }
+      setAuthed(true); // session live → open the SSE stream
+      await Promise.all([loadShell(th), loadContent('/', th)]);
     } catch (e: any) {
       setError(String(e?.message ?? e));
       setStatus('error');
     }
   }
 
-  async function connect() {
+  // Submit credentials from the login screen. Throws on bad creds so the screen
+  // can show the message inline; on success, loads the shell + dashboard.
+  async function signIn(username: string, password: string) {
+    const client = clientRef.current;
+    if (!client) throw new Error('Not connected to a server.');
+    await client.login(username, password); // the client persists the credentials
+    setAuthed(true); // session live → open the SSE stream
+    await Promise.all([loadShell(theme), loadContent('/', theme)]);
+  }
+
+  // Re-check the session, used when the app returns to the foreground while the
+  // login screen is up — a tapped SSO button sends the user to the IdP in the
+  // system browser, and the round-trip authenticates us out of band. If we're now
+  // signed in, drop into the app; otherwise stay put.
+  async function recheckSession() {
     const client = clientRef.current;
     if (!client) return;
-    setStatus('connecting');
     try {
-      let me = await client.me();
-      if (!me.authenticated) me = await client.login('admin', 'admin');
-      await Promise.all([loadShell(), loadContent('/')]);
-    } catch (e: any) {
-      setError(String(e?.message ?? e));
-      setStatus('error');
+      if (!(await client.me()).authenticated) return;
+      setAuthed(true);
+      setStatus('connecting');
+      await Promise.all([loadShell(theme), loadContent('/', theme)]);
+    } catch {
+      /* still signed out — stay on the login screen */
     }
   }
 
   // Point the app at a server: spin up a fresh client, reset per-server state,
   // leave the picker, persist it as last-used, then connect.
-  function connectTo(url: string) {
+  function connectTo(url: string, th: 'light' | 'dark' = theme) {
     clientRef.current = new OnecClient(url);
     setProfile(undefined);
     setShell(null);
@@ -96,10 +285,12 @@ export default function App() {
     setRoute('/');
     setStatus('connecting');
     setError('');
+    setAuthed(false);
+    setLoginCard(null); // belongs to the previous server; connect() refetches it
     setServerUrl(url);
     setBooting(false);
     rememberServer(url).then(setServers).catch(() => {});
-    connect();
+    connect(th);
   }
 
   // Drop back to the server picker (used by logout and "Change server").
@@ -109,20 +300,72 @@ export default function App() {
     setContent(null);
     setShell(null);
     setError('');
+    setAuthed(false);
+    setLoginCard(null);
     loadServers().then(setServers).catch(() => {});
   }
 
-  // Startup: auto-connect to the last-used server, or open the picker.
+  // Startup: restore the saved theme, then auto-connect to the last-used server
+  // (or open the picker). The restored theme is threaded into connect so the
+  // first shell/content fetch is already themed — no light→dark reflow.
   useEffect(() => {
     (async () => {
+      const storedTheme = await getStoredTheme();
+      if (storedTheme) setTheme(storedTheme);
       const list = await loadServers();
       setServers(list);
       const last = await getLastServer();
-      if (last) connectTo(last);
+      if (last) connectTo(last, storedTheme ?? theme);
       else setBooting(false);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Reset the tracked scroll offset on navigation so the fade returns to hidden
+  // for the next page instead of staying stuck visible from the previous scroll.
+  useEffect(() => {
+    scrollY.setValue(0);
+  }, [route, scrollY]);
+
+  // While the login screen is up, re-check the session whenever the app comes back
+  // to the foreground — that's how an SSO round-trip (the user taps a provider
+  // button, authenticates in the system browser, returns) drops them into the app.
+  useEffect(() => {
+    if (status !== 'login') return;
+    const sub = AppState.addEventListener('change', (s) => {
+      if (s === 'active') recheckSession();
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status]);
+
+  // ----- live updates over SSE (mirrors the web's useUiEvents) -----
+  // While signed in, hold one stream to `/api/events`. When an event touches the
+  // surface we're showing, reload it (debounced — a post emits several events at
+  // once). Re-subscribes only on server switch / sign-in, not on navigation.
+  useEffect(() => {
+    if (!serverUrl || !authed) return;
+    // eslint-disable-next-line no-console
+    console.log('[sse] subscribing (route', routeRef.current + ')');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stop = subscribeUiEvents(serverUrl, (event) => {
+      // Fan out to data-driven customs (onec-list, onec-widget) so they refetch their
+      // own rows — reloading the content card alone doesn't, since they load on mount.
+      publishUiEvent(event);
+      // Server-rendered surfaces (detail fields, register reports) live in the card, so
+      // reload it when the event touches the route we're on.
+      const matched = affectsSurface(event, routeRef.current);
+      // eslint-disable-next-line no-console
+      console.log('[sse] handler route=' + routeRef.current, 'matched=' + matched, event.type, event.entityType ?? '', event.entityName ?? '');
+      if (!matched) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => reloadRef.current(), 150);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      stop();
+    };
+  }, [serverUrl, authed]);
 
   // ----- onec:// action routing (mirrors the Flutter HomeShell) -----
   function onAction(url: string) {
@@ -131,13 +374,32 @@ export default function App() {
 
     if (rest === 'logout') {
       // Log out, then drop back to the server picker so the user can choose
-      // (or re-pick) a server rather than silently re-logging into this one.
+      // (or re-pick) a server rather than silently re-logging into this one. The
+      // client also forgets the saved credentials, so the next connect lands on
+      // the login screen instead of auto signing back in.
       Promise.resolve(clientRef.current?.logout()).finally(showPicker);
+      return;
+    }
+    if (rest.startsWith('auth/sso/')) {
+      // An SSO provider button on the server-driven login card. Mirror the web:
+      // redirect to the `?to=` target when it's a same-origin path, else the OIDC
+      // `/oauth2/authorization/{id}` convention. We open it in the system browser;
+      // on return, the foreground re-check (see the AppState effect) signs us in.
+      const tail = rest.slice('auth/sso/'.length);
+      const q = tail.indexOf('?');
+      const id = q >= 0 ? tail.slice(0, q) : tail;
+      const to = q >= 0 ? new URLSearchParams(tail.slice(q + 1)).get('to') : null;
+      const path = to && to.startsWith('/') ? to : id ? `/oauth2/authorization/${id}` : null;
+      if (path) {
+        const href = `${serverUrl?.replace(/\/$/, '')}${path}`;
+        Linking.openURL(href).catch(() => toast.error("Couldn't open the sign-in page"));
+      }
       return;
     }
     if (rest === 'theme/toggle') {
       const next = theme === 'light' ? 'dark' : 'light';
       setTheme(next);
+      setStoredTheme(next); // remember it across launches, like the web
       // refetch with the new theme explicitly (state update hasn't applied yet)
       loadShell(next);
       loadContent(route, next);
@@ -147,6 +409,11 @@ export default function App() {
       const q = rest.indexOf('?');
       const params = new URLSearchParams(q >= 0 ? rest.slice(q + 1) : '');
       setProfile(params.get('profile') ?? undefined);
+      // The onec-login-form custom fires `onec://app` after a successful sign-in
+      // on the server-driven card, so this is also the "login succeeded" path —
+      // mark the session live (opens the SSE stream). A no-op when already authed
+      // (a plain profile switch).
+      setAuthed(true);
       setTimeout(() => {
         loadShell();
         loadContent('/');
@@ -158,25 +425,90 @@ export default function App() {
       if (p.length >= 4) confirmDelete(p[1], p[2], p[3]);
       return;
     }
+    if (rest.startsWith('action/')) {
+      // action/{kind}/{name}/{key}/{id} — a custom server action. POST it (errors
+      // self-toast), surface the result message, then navigate or refresh in place.
+      const [kind, name, key, id] = rest.slice('action/'.length).split('/');
+      if (kind && name && key) runServerAction(kind, name, key, id);
+      return;
+    }
+    if (rest.startsWith('post/') || rest.startsWith('unpost/')) {
+      // post/{name}/{id} | unpost/{name}/{id} — drive the document's posting state.
+      const unpost = rest.startsWith('unpost/');
+      const [name, id] = rest.slice((unpost ? 'unpost/' : 'post/').length).split('/');
+      if (name && id) togglePosting(unpost, name, id);
+      return;
+    }
+    if (rest.startsWith('open/') || rest.startsWith('redirect/') || rest.startsWith('download/')) {
+      // A stored file / external URL — hand off to the OS browser. Re-root an
+      // app-relative path against the current server; pass an absolute URL verbatim.
+      const prefix = rest.startsWith('open/') ? 'open/' : rest.startsWith('redirect/') ? 'redirect/' : 'download/';
+      const target = rest.slice(prefix.length);
+      const href = /^https?:\/\//i.test(target) ? target : `${serverUrl?.replace(/\/$/, '')}/${target.replace(/^\//, '')}`;
+      Linking.openURL(href).catch(() => toast.error("Couldn't open the link"));
+      return;
+    }
     loadContent(('/' + rest).replace('//', '/'));
   }
 
-  function confirmDelete(kind: string, name: string, id: string) {
-    Alert.alert('Delete record?', 'This marks the record for deletion.', [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Delete',
-        style: 'destructive',
-        onPress: async () => {
-          try {
-            await clientRef.current?.deleteEntity(kind, name, id);
-            loadContent(`/${kind}/${name}`);
-          } catch (e: any) {
-            Alert.alert('Delete failed', String(e?.message ?? e));
-          }
-        },
-      },
-    ]);
+  // Run a custom EntityView action and apply its ActionResult. A loading toast gives
+  // feedback while a slow/async handler runs; on success show its message, then either
+  // navigate (if it asked) or reload the current surface so the change shows immediately.
+  async function runServerAction(kind: string, name: string, key: string, id?: string) {
+    const loadingId = toast.loading('Working…');
+    try {
+      const result = await clientRef.current!.runAction(kind, name, key, { id });
+      toast.dismiss(loadingId);
+      if (result.message) toast.success(result.message);
+      if (result.navigate) onAction(result.navigate);
+      else loadContent(routeRef.current);
+    } catch {
+      toast.dismiss(loadingId); // the client already toasted the failure
+    }
+  }
+
+  // Post / unpost a document, then refresh the detail surface (the SSE stream also
+  // nudges it, but reloading here makes it instant and works even if SSE is down).
+  async function togglePosting(unpost: boolean, name: string, id: string) {
+    try {
+      if (unpost) await clientRef.current!.unpostDocument(name, id);
+      else await clientRef.current!.postDocument(name, id);
+      toast.success(unpost ? 'Document unposted' : 'Document posted');
+      loadContent(routeRef.current);
+    } catch {
+      /* the client already toasted the failure */
+    }
+  }
+
+  // Bottom-bar taps route through here so switching tabs gives a selection
+  // haptic. Only a real tab change buzzes — re-tapping the active tab, or the
+  // non-navigation actions (theme/profile/logout/delete), stay silent. In-content
+  // navigation uses onAction directly and never buzzes.
+  function fireNav(url: string) {
+    if (url.startsWith('onec://')) {
+      const rest = url.slice('onec://'.length); // '' is the Home tab (route '/')
+      const navigates = !/^(logout|theme\/|app|delete\/|action\/|post\/|unpost\/|open\/|redirect\/|download\/)/.test(rest);
+      const target = ('/' + rest).replace('//', '/');
+      if (navigates && target !== route) Haptics.selectionAsync().catch(() => {});
+    }
+    onAction(url);
+  }
+
+  async function confirmDelete(kind: string, name: string, id: string) {
+    const ok = await confirm({
+      title: 'Delete record?',
+      message: 'This marks the record for deletion. This can’t be undone here.',
+      confirmLabel: 'Delete',
+      destructive: true,
+      icon: 'trash-2',
+    });
+    if (!ok) return;
+    try {
+      await clientRef.current?.deleteEntity(kind, name, id);
+      loadContent(`/${kind}/${name}`); // back to the list (the failure self-toasts)
+    } catch {
+      /* the client already toasted the failure */
+    }
   }
 
   const navVars = { active_path: route };
@@ -210,29 +542,81 @@ export default function App() {
           servers={servers}
           bottomInset={insets.bottom}
           onConnect={connectTo}
-          onRemove={(url) => removeServer(url).then(setServers).catch(() => {})}
+          onRemove={(url) => {
+            clearCredentials(url).catch(() => {}); // forget its saved creds too
+            removeServer(url).then(setServers).catch(() => {});
+          }}
         />
       </View>
     );
   }
 
+  if (status === 'login') {
+    return (
+      <View style={[styles.screen, { backgroundColor: c.bg, paddingTop: insets.top }]}>
+        <StatusBar style={theme === 'dark' ? 'light' : 'dark'} />
+        {loginCard ? (
+          // The server-driven login card: password form (onec-login-form custom)
+          // and/or SSO buttons, whatever this server offers. Centered + padded,
+          // with a host-supplied "Change server" affordance the web doesn't need.
+          <ScrollView
+            contentContainerStyle={{
+              flexGrow: 1,
+              justifyContent: 'center',
+              paddingHorizontal: 24,
+              paddingTop: 24,
+              paddingBottom: 24 + insets.bottom,
+            }}
+            keyboardShouldPersistTaps="handled"
+            automaticallyAdjustKeyboardInsets
+            showsVerticalScrollIndicator={false}
+          >
+            <DivCard
+              envelope={loginCard}
+              theme={theme}
+              client={clientRef.current!}
+              baseUrl={serverUrl}
+              fire={onAction}
+            />
+            <Pressable onPress={showPicker} hitSlop={8} style={styles.changeServer}>
+              <Text style={[styles.changeServerText, { color: c.muted }]}>Change server</Text>
+            </Pressable>
+          </ScrollView>
+        ) : (
+          // Fallback for a server with no /api/divkit/login endpoint.
+          <LoginScreen
+            theme={theme}
+            serverLabel={serverUrl.replace(/^https?:\/\//, '')}
+            bottomInset={insets.bottom}
+            onSubmit={signIn}
+            onChangeServer={showPicker}
+          />
+        )}
+      </View>
+    );
+  }
+
   return (
-    // Apply the top inset here (notch / status bar) so headers aren't clipped.
-    // The bottom inset is handled per-child: on the scroll padding and the nav
-    // bar, so the floating bar can sit flush against the home indicator.
-    <View style={[styles.screen, { backgroundColor: c.bg, paddingTop: insets.top }]}>
+    // The scroll surface runs edge-to-edge (under the notch) so content can
+    // dissolve *behind* the status bar via TopFade. The top inset therefore lives
+    // on the scroll content padding, not here — at-rest content sits in the same
+    // place, but scrolled content passes behind the safe area. The bottom inset is
+    // handled per-child (scroll padding + nav bar).
+    <View style={[styles.screen, { backgroundColor: c.bg }]}>
       <StatusBar style={theme === 'dark' ? 'light' : 'dark'} />
 
       <View style={{ flex: 1 }}>
         {status === 'connecting' && !content ? (
-          <View style={styles.center}>
+          <View style={[styles.center, { paddingTop: insets.top }]}>
             <ActivityIndicator color={c.text} />
-            <Text style={[styles.muted, { color: c.muted }]}>Connecting to {serverUrl.replace(/^https?:\/\//, '')}…</Text>
+            {/* Server text only on the cold connect; in-app navigation just spins. */}
+            {!shell && <Text style={[styles.muted, { color: c.muted }]}>Connecting to {serverUrl}…</Text>}
           </View>
         ) : status === 'error' ? (
           <View style={styles.center}>
             <Text style={styles.errTitle}>Couldn’t reach the server</Text>
             <Text style={[styles.muted, { color: c.muted }]}>{error}</Text>
+            <Text style={[styles.muted, { color: c.muted, fontSize: 11 }]} selectable>{serverUrl}/api/auth/me</Text>
             <View style={styles.errActions}>
               <Pressable style={[styles.btn, { backgroundColor: c.accentBg }]} onPress={() => loadContent(route)}>
                 <Text style={[styles.btnText, { color: c.accentFg }]}>Retry</Text>
@@ -243,7 +627,18 @@ export default function App() {
             </View>
           </View>
         ) : content ? (
-          <ScrollView contentContainerStyle={{ paddingHorizontal: pad, paddingTop: pad, paddingBottom: pad + insets.bottom + (hasBottomBar ? NAV_RESERVE : 0) }}>
+          <Animated.ScrollView
+            contentContainerStyle={{ paddingHorizontal: pad, paddingTop: insets.top + pad, paddingBottom: pad + insets.bottom + (hasBottomBar ? NAV_RESERVE : 0) }}
+            scrollIndicatorInsets={{ top: insets.top }}
+            // Keep form fields above the keyboard: inset + scroll the focused input
+            // into view (iOS). Without this, lower fields on entity forms hide behind it.
+            automaticallyAdjustKeyboardInsets
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="interactive"
+            scrollEnabled={!scrollLocked}
+            onScroll={Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], { useNativeDriver: true })}
+            scrollEventThrottle={16}
+          >
             <DivCard
               key={route}
               envelope={content}
@@ -251,36 +646,92 @@ export default function App() {
               client={clientRef.current!}
               baseUrl={serverUrl}
               fire={onAction}
+              prefetch={prefetchContent}
+              linkFor={linkFor}
               refresh={() => loadContent(route)}
+              lockScroll={setScrollLocked}
               vars={{ ...((content as any).vars ?? {}), ...navVars }}
             />
             {status === 'connecting' && (
               <View style={{ paddingVertical: 16 }}><ActivityIndicator /></View>
             )}
-          </ScrollView>
+          </Animated.ScrollView>
         ) : null}
+
+        {/* Content scrolls behind the notch; this keeps the safe area opaque and
+            dissolves the content into it just below, instead of a hard clip line. */}
+        <TopFade color={c.bg} topInset={insets.top} opacity={topFadeOpacity} />
 
         {hasBottomBar && (
           // The server's nav card draws its own pill (white bg, rounded border,
-          // 12px margins) — we just pin it to the bottom and let it render.
-          <View style={[styles.navBar, { paddingBottom: insets.bottom }]} pointerEvents="box-none">
+          // 12px margins) — we just pin it to the bottom and let it render. It's
+          // a *floating* bar, so it only needs a small clearance above the home
+          // indicator, not a full safe-area inset (which left a large empty gap).
+          <View
+            style={[styles.navBar, { paddingBottom: insets.bottom > 0 ? NAV_BOTTOM_CLEARANCE : 0 }]}
+            pointerEvents="box-none"
+            onLayout={(e) => setNavHeight(e.nativeEvent.layout.height)}
+          >
             <DivCard
               envelope={shell!.nav as DivCardEnvelope}
               theme={theme}
               client={clientRef.current!}
               baseUrl={serverUrl}
-              fire={onAction}
+              fire={fireNav}
+              prefetch={prefetchContent}
+              linkFor={linkFor}
               vars={navVars}
             />
           </View>
         )}
       </View>
+
+      {/* Toasts float just above the nav bar (measured), or above the home indicator
+          when there's no nav. The Toaster adds its own 12px gap on top of this. */}
+      <Toaster
+        theme={theme}
+        bottomOffset={hasBottomBar ? navHeight || insets.bottom + NAV_RESERVE : insets.bottom}
+      />
+      <ConfirmHost theme={theme} />
+      <ContextMenuHost theme={theme} />
     </View>
+  );
+}
+
+// Pinned to the very top of the screen (behind the notch). Stays fully opaque
+// through the safe-area inset — so the status bar always has a clean backdrop and
+// content passing behind it is hidden — then fades to transparent over TOP_FADE px
+// just below, dissolving content rather than meeting a hard clip line. Measures its
+// own width — RN SVG needs explicit sizes.
+function TopFade({ color, topInset, opacity }: { color: string; topInset: number; opacity: Animated.AnimatedInterpolation<number> }) {
+  const [w, setW] = useState(0);
+  const h = topInset + TOP_FADE;
+  const solid = h > 0 ? topInset / h : 0; // opaque from the top through the inset
+  return (
+    <Animated.View
+      pointerEvents="none"
+      onLayout={(e) => setW(e.nativeEvent.layout.width)}
+      style={[styles.topFade, { height: h, opacity }]}
+    >
+      {w > 0 && (
+        <Svg width={w} height={h}>
+          <Defs>
+            <SvgLinearGradient id="topFade" x1="0" y1="0" x2="0" y2="1">
+              <Stop offset="0" stopColor={color} stopOpacity={1} />
+              <Stop offset={solid} stopColor={color} stopOpacity={1} />
+              <Stop offset="1" stopColor={color} stopOpacity={0} />
+            </SvgLinearGradient>
+          </Defs>
+          <Rect x="0" y="0" width={w} height={h} fill="url(#topFade)" />
+        </Svg>
+      )}
+    </Animated.View>
   );
 }
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: '#FFFFFF' },
+  topFade: { position: 'absolute', top: 0, left: 0, right: 0 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 10, padding: 24 },
   muted: { color: '#6B7280', fontSize: 13, textAlign: 'center' },
   errTitle: { fontSize: 15, fontWeight: '700', color: '#B91C1C' },
@@ -289,4 +740,6 @@ const styles = StyleSheet.create({
   btnOutline: { borderWidth: 1, paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8 },
   btnText: { color: '#FFFFFF', fontWeight: '600', fontSize: 13 },
   navBar: { position: 'absolute', left: 0, right: 0, bottom: 0 },
+  changeServer: { alignItems: 'center', marginTop: 24, paddingVertical: 6 },
+  changeServerText: { fontSize: 14, fontWeight: '500' },
 });

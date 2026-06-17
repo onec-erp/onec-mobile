@@ -3,13 +3,17 @@
 // GET /api/list/{kind}/{name} and renders a bordered, horizontally-scrollable
 // table. Row tap opens onec://{kind}/{name}/{id}. Port of onec_list.dart.
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Image, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 import type { Row } from '../../api/onecClient';
 import { applyFormat, isAvatarWidget, isImageWidget, looksLikeImageUrl } from '../format';
-import { colors, type ThemeColors } from '../theme';
+import { ContextMenuArea } from '../longPress';
+import { colors, isDark, type ThemeColors } from '../theme';
 import type { CustomRenderer, DivHost } from '../types';
+import { useLiveRefresh } from '../useLiveRefresh';
 import { LucideIcon } from './lucide';
+import { Touchable } from '../../ui/touchable';
+import { geoSourceFrom, hasGeoSource, ListMapView } from './geo';
 
 interface Col {
   columnName: string;
@@ -49,18 +53,42 @@ function OnecList({ desc, host }: { desc: Record<string, any>; host: DivHost }) 
   const newUrl = desc.newUrl as string | undefined;
   const columns: Col[] = Array.isArray(desc.columns) ? desc.columns : [];
 
-  const [rows, setRows] = useState<Row[]>([]);
-  const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(true);
+  // Optional map view: the server attaches a `map` config (geo columns) to lists whose
+  // records have a location. When present, offer a List/Map toggle (web: list.map).
+  const mapCfg = desc.map && typeof desc.map === 'object' ? (desc.map as Record<string, any>) : null;
+  const mapSource = useMemo(() => (mapCfg ? geoSourceFrom((k) => String(mapCfg[k] ?? '')) : null), [mapCfg]);
+  const hasMap = !!mapSource && hasGeoSource(mapSource);
+  const [view, setView] = useState<'table' | 'map'>(mapCfg?.defaultView ? 'map' : 'table');
+
+  // Seed the first page from cache so a revisited list paints instantly; the
+  // mount effect then revalidates it in the background (no full spinner).
+  const seed = host.client.peekListRows(kind, name, {
+    q: '',
+    limit: pageSize,
+    offset: 0,
+    sort: desc.sort?.column ?? undefined,
+    descending: desc.sort?.descending === true,
+  });
+  const [rows, setRows] = useState<Row[]>(() => seed?.rows ?? []);
+  const [total, setTotal] = useState(() => seed?.total ?? 0);
+  const [loading, setLoading] = useState(() => !seed);
   const [loadingMore, setLoadingMore] = useState(false);
+  // Dim the table only for a user-initiated reload (sort/search); a background
+  // revalidation refreshes silently (just the small header spinner).
+  const [dimming, setDimming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [sortColumn, setSortColumn] = useState<string | null>(desc.sort?.column ?? null);
   const [sortDesc, setSortDesc] = useState<boolean>(desc.sort?.descending === true);
   const debounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  async function load(reset: boolean, q = query, sc = sortColumn, sd = sortDesc) {
-    reset ? setLoading(true) : setLoadingMore(true);
+  async function load(reset: boolean, q = query, sc = sortColumn, sd = sortDesc, background = false) {
+    if (reset) {
+      setLoading(true);
+      if (!background) setDimming(true);
+    } else {
+      setLoadingMore(true);
+    }
     setError(null);
     try {
       const page = await host.client.listRows(kind, name, {
@@ -77,13 +105,22 @@ function OnecList({ desc, host }: { desc: Record<string, any>; host: DivHost }) 
     } finally {
       setLoading(false);
       setLoadingMore(false);
+      setDimming(false);
     }
   }
 
   useEffect(() => {
-    load(true);
+    // Recently fetched → trust the seeded cache; skip the mount revalidation so a
+    // quick revisit costs no network and no re-render. (SSE still refreshes below.)
+    if (host.client.freshListRows(kind, name, { q: '', limit: pageSize, offset: 0, sort: desc.sort?.column ?? undefined, descending: desc.sort?.descending === true })) return;
+    // Otherwise revalidate on mount; background so seeded rows refresh without dimming.
+    load(true, query, sortColumn, sortDesc, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, name]);
+
+  // Live updates: when a write to this entity arrives over SSE, refresh the visible
+  // window in place (background — keeps rows on screen, just re-pulls them).
+  useLiveRefresh(kind, name, () => load(true, query, sortColumn, sortDesc, true));
 
   function onQuery(q: string) {
     setQuery(q);
@@ -103,64 +140,136 @@ function OnecList({ desc, host }: { desc: Record<string, any>; host: DivHost }) 
     load(true, query, nextCol, nextDesc);
   }
 
-  const widths = columns.map((col, i) => colWidth(col, i === 0));
-  const tableWidth = widths.reduce((a, b) => a + b, 0) + 24;
+  const widths = useMemo(() => columns.map((col, i) => colWidth(col, i === 0)), [columns]);
+  const tableWidth = useMemo(() => widths.reduce((a, b) => a + b, 0) + 24, [widths]);
+  // Stable so memoized rows don't re-render as the list grows.
+  const onOpen = useCallback(
+    (row: Row) => {
+      if (row._id != null) host.fire(`onec://${kind}/${name}/${row._id}`);
+    },
+    [host, kind, name],
+  );
+  // Warm the detail card on touch-down so it's usually ready by the time the tap lands.
+  const onPrefetch = useCallback(
+    (row: Row) => {
+      if (row._id != null) host.prefetch?.(`onec://${kind}/${name}/${row._id}`);
+    },
+    [host, kind, name],
+  );
+
+  // Progressive render: paint the first chunk immediately, then reveal the rest a
+  // chunk per frame, so mounting a long list never blocks the thread. Rows are
+  // memoized (RowItem), so each frame only mounts the newly-revealed rows. A
+  // re-mount (navigation) restarts from the first chunk — that's the whole point.
+  const FIRST_PAINT = 12; // ≈ one screenful — rendered on the first frame for the fastest paint
+  const STEP = 40; // then fill the rest in bigger batches so the list completes in a few frames
+  const [limit, setLimit] = useState(FIRST_PAINT);
+  useEffect(() => {
+    if (limit >= rows.length) return;
+    const raf = requestAnimationFrame(() => setLimit((n) => Math.min(n + STEP, rows.length)));
+    return () => cancelAnimationFrame(raf);
+  }, [limit, rows.length]);
+  // A neutral row-press highlight (`surface` collapses into `card` in dark, so pick per theme).
+  const rowPress = isDark(c) ? '#262626' : '#F3F4F6';
   const title = (desc.title as string) ?? name;
+  // First fetch (nothing to show yet) → full spinner. A re-sort/search of an
+  // already-loaded list keeps its rows on screen and refreshes them in place.
+  const initialLoading = loading && rows.length === 0;
+  const reloading = loading && rows.length > 0;
 
   return (
     <View>
       <Text style={{ fontSize: 22, fontWeight: '700', color: c.text }}>{title}</Text>
-      {!loading && <Text style={{ color: c.muted, fontSize: 13 }}>{total} {total === 1 ? 'row' : 'rows'}</Text>}
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, minHeight: 18 }}>
+        {!initialLoading && <Text style={{ color: c.muted, fontSize: 13 }}>{total} {total === 1 ? 'row' : 'rows'}</Text>}
+        {reloading && <ActivityIndicator size="small" color={c.muted} />}
+      </View>
 
-      {searchable && (
+      {/* Toolbar (web parity): the Table/Map segmented control sits inline with the
+          search box and New button. Search is table-only; a flex spacer keeps New
+          right-aligned in map mode. */}
+      {(hasMap || searchable || newUrl) && (
         <View style={{ flexDirection: 'row', gap: 8, marginTop: 12, alignItems: 'center' }}>
-          <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 6, borderWidth: 1, borderColor: c.fieldBorder, borderRadius: 8, paddingHorizontal: 10, height: 40, backgroundColor: c.fieldBg }}>
-            <LucideIcon name="search" size={16} color={c.muted} />
-            <TextInput placeholder="Search…" placeholderTextColor={c.muted} style={{ flex: 1, fontSize: 14, color: c.text, paddingVertical: 0 }} onChangeText={onQuery} />
-          </View>
+          {hasMap && (
+            <View style={{ flexDirection: 'row', height: 40, alignItems: 'center', borderWidth: 1, borderColor: c.border, borderRadius: 8, backgroundColor: c.surface, padding: 2 }}>
+              {(['table', 'map'] as const).map((v) => {
+                const active = view === v;
+                return (
+                  <Touchable
+                    key={v}
+                    onPress={() => setView(v)}
+                    style={{
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      width: 38,
+                      height: 32,
+                      borderRadius: 6,
+                      backgroundColor: active ? c.card : 'transparent',
+                      ...(active ? { shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 2, shadowOffset: { width: 0, height: 1 }, elevation: 1 } : null),
+                    }}
+                  >
+                    <LucideIcon name={v === 'table' ? 'table-2' : 'map'} size={16} color={active ? c.text : c.muted} />
+                  </Touchable>
+                );
+              })}
+            </View>
+          )}
+          {searchable && view === 'table' ? (
+            <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 6, borderWidth: 1, borderColor: c.fieldBorder, borderRadius: 8, paddingHorizontal: 10, height: 40, backgroundColor: c.fieldBg }}>
+              <LucideIcon name="search" size={16} color={c.muted} />
+              <TextInput placeholder="Search…" placeholderTextColor={c.muted} style={{ flex: 1, fontSize: 14, color: c.text, paddingVertical: 0 }} onChangeText={onQuery} />
+            </View>
+          ) : (
+            <View style={{ flex: 1 }} />
+          )}
           {newUrl && (
-            <Pressable style={{ width: 44, height: 40, borderRadius: 8, backgroundColor: c.accentBg, alignItems: 'center', justifyContent: 'center' }} onPress={() => host.fire(newUrl)}>
+            <Touchable style={{ width: 44, height: 40, borderRadius: 8, backgroundColor: c.accentBg, alignItems: 'center', justifyContent: 'center' }} onPress={() => host.fire(newUrl)}>
               <LucideIcon name="plus" size={20} color={c.accentFg} />
-            </Pressable>
+            </Touchable>
           )}
         </View>
       )}
 
-      {loading ? (
+      {view === 'map' && hasMap && mapSource ? (
+        <ListMapView kind={kind} name={name} source={mapSource} labelField={mapCfg?.labelField} host={host} />
+      ) : initialLoading ? (
         <View style={{ alignItems: 'center', paddingVertical: 32 }}><ActivityIndicator color={c.text} /></View>
       ) : error ? (
         <View style={{ alignItems: 'center', paddingVertical: 32, gap: 10 }}>
           <Text style={{ color: c.muted, fontSize: 13 }}>Failed to load: {error}</Text>
-          <Pressable style={{ backgroundColor: c.accentBg, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8 }} onPress={() => load(true)}>
+          <Touchable style={{ backgroundColor: c.accentBg, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8 }} onPress={() => load(true)}>
             <Text style={{ color: c.accentFg, fontWeight: '600', fontSize: 13 }}>Retry</Text>
-          </Pressable>
+          </Touchable>
         </View>
       ) : rows.length === 0 ? (
         <View style={{ alignItems: 'center', paddingVertical: 32 }}><Text style={{ color: c.muted, fontSize: 13 }}>{query ? 'No matches.' : 'No records.'}</Text></View>
       ) : (
         <>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 12, borderWidth: 1, borderColor: c.border, borderRadius: 10 }}>
-            <View style={{ width: tableWidth }}>
+            <View style={{ width: tableWidth, opacity: dimming ? 0.5 : 1 }} pointerEvents={dimming ? 'none' : 'auto'}>
               <View style={{ flexDirection: 'row', paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: c.border }}>
                 {columns.map((col, i) => (
-                  <Pressable key={i} style={{ width: widths[i], flexDirection: 'row', alignItems: 'center' }} onPress={() => toggleSort(col.columnName)}>
+                  <Touchable key={i} style={{ width: widths[i], flexDirection: 'row', alignItems: 'center' }} onPress={() => toggleSort(col.columnName)}>
                     <Text style={{ fontSize: 12, color: c.muted, fontWeight: '500', flexShrink: 1 }} numberOfLines={1}>{col.label ?? col.columnName}</Text>
                     <LucideIcon name={sortColumn !== col.columnName ? 'chevrons-up-down' : sortDesc ? 'arrow-down' : 'arrow-up'} size={13} color={c.muted} />
-                  </Pressable>
+                  </Touchable>
                 ))}
               </View>
-              {rows.map((row, r) => (
-                <Pressable
+              {rows.slice(0, limit).map((row, r) => (
+                <RowItem
                   key={r}
-                  style={{ flexDirection: 'row', paddingHorizontal: 12, paddingVertical: 12, borderBottomWidth: r < rows.length - 1 ? 1 : 0, borderBottomColor: c.border }}
-                  onPress={() => { if (row._id != null) host.fire(`onec://${kind}/${name}/${row._id}`); }}
-                >
-                  {columns.map((col, i) => (
-                    <View key={i} style={{ width: widths[i], paddingRight: 12 }}>
-                      <Cell row={row} col={col} first={i === 0} c={c} baseUrl={host.baseUrl} />
-                    </View>
-                  ))}
-                </Pressable>
+                  row={row}
+                  columns={columns}
+                  widths={widths}
+                  c={c}
+                  baseUrl={host.baseUrl}
+                  rowPress={rowPress}
+                  last={r === rows.length - 1}
+                  onOpen={onOpen}
+                  onPrefetch={onPrefetch}
+                  host={host}
+                  rowUrl={row._id != null ? `onec://${kind}/${name}/${row._id}` : undefined}
+                />
               ))}
             </View>
           </ScrollView>
@@ -169,9 +278,9 @@ function OnecList({ desc, host }: { desc: Record<string, any>; host: DivHost }) 
               {loadingMore ? (
                 <ActivityIndicator color={c.text} />
               ) : (
-                <Pressable style={{ backgroundColor: c.accentBg, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8 }} onPress={() => load(false)}>
+                <Touchable style={{ backgroundColor: c.accentBg, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8 }} onPress={() => load(false)}>
                   <Text style={{ color: c.accentFg, fontWeight: '600', fontSize: 13 }}>Load more ({total - rows.length})</Text>
-                </Pressable>
+                </Touchable>
               )}
             </View>
           )}
@@ -205,6 +314,53 @@ function Cell({ row, col, first, c, baseUrl }: { row: Row; col: Col; first: bool
     </Text>
   );
 }
+
+// A single table row. Memoized so progressive reveal (and any list re-render)
+// only mounts newly-added rows — all props are referentially stable per row.
+const RowItem = React.memo(function RowItem({
+  row,
+  columns,
+  widths,
+  c,
+  baseUrl,
+  rowPress,
+  last,
+  onOpen,
+  onPrefetch,
+  host,
+  rowUrl,
+}: {
+  row: Row;
+  columns: Col[];
+  widths: number[];
+  c: ThemeColors;
+  baseUrl?: string;
+  rowPress: string;
+  last: boolean;
+  onOpen: (row: Row) => void;
+  onPrefetch: (row: Row) => void;
+  host: DivHost;
+  rowUrl?: string;
+}) {
+  // Long-press a row = the web's right-click on a record link: a Copy link / Open
+  // in browser menu for that record, slide-to-select like an iOS context menu.
+  return (
+    <ContextMenuArea host={host} url={rowUrl}>
+      <Pressable
+        style={({ pressed }) => ({ flexDirection: 'row', paddingHorizontal: 12, paddingVertical: 12, borderBottomWidth: last ? 0 : 1, borderBottomColor: c.border, backgroundColor: pressed ? rowPress : 'transparent' })}
+        android_ripple={{ color: rowPress }}
+        onPress={() => onOpen(row)}
+        onPressIn={() => onPrefetch(row)}
+      >
+        {columns.map((col, i) => (
+          <View key={i} style={{ width: widths[i], paddingRight: 12 }}>
+            <Cell row={row} col={col} first={i === 0} c={c} baseUrl={baseUrl} />
+          </View>
+        ))}
+      </Pressable>
+    </ContextMenuArea>
+  );
+});
 
 export const onecList: CustomRenderer = ({ block, host }) => {
   const desc = (block.custom_props?.list as Record<string, any>) ?? {};

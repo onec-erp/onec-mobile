@@ -44,22 +44,48 @@ export function formatNumber(value: number, o: NumberFormatOptions = {}): string
   return formatPlain(value, o);
 }
 
+// React Native's Hermes engine ships Intl.NumberFormat but ignores the
+// `notation: 'compact'` option — `1000` comes back as "1,000" instead of the
+// web's "1K". So compact by hand (K/M/B/T) to match lib/format.ts on the web:
+// 1 fraction digit, 0 for integer counts, trailing zeros trimmed ("1K", "1.2M").
+const COMPACT_TIERS = [
+  { v: 1e12, s: 'T' },
+  { v: 1e9, s: 'B' },
+  { v: 1e6, s: 'M' },
+  { v: 1e3, s: 'K' },
+] as const;
+
+function trimZeros(s: string): string {
+  return s.includes('.') ? s.replace(/\.?0+$/, '') : s;
+}
+
+function compactDigits(value: number, maxFrac: number): string {
+  const tier = COMPACT_TIERS.find((t) => Math.abs(value) >= t.v);
+  if (!tier) return trimZeros(value.toFixed(maxFrac));
+  return `${trimZeros((value / tier.v).toFixed(maxFrac))}${tier.s}`;
+}
+
+/** The currency symbol for a code (e.g. "$", "€"); plain currency formatting
+ *  works in Hermes, it's only compact notation that doesn't. */
+function currencySymbol(currency: string, locale?: string): string | null {
+  try {
+    const part = new Intl.NumberFormat(locale, { style: 'currency', currency, maximumFractionDigits: 0 })
+      .formatToParts(0)
+      .find((p) => p.type === 'currency');
+    return part?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function formatCompact(value: number, o: NumberFormatOptions = {}): string {
   const unit = o.unit?.trim();
-  const compact = (cur?: string) =>
-    new Intl.NumberFormat(o.locale, {
-      notation: 'compact',
-      ...(cur ? { style: 'currency', currency: cur } : {}),
-    }).format(value);
-  if (unit) return attachUnit(compact(), unit, o.unitPosition);
+  if (unit) return attachUnit(compactDigits(value, 1), unit, o.unitPosition);
   if (o.currency) {
-    try {
-      return compact(o.currency);
-    } catch {
-      /* fall through */
-    }
+    const sym = currencySymbol(o.currency, o.locale);
+    if (sym) return `${sym}${compactDigits(value, 1)}`;
   }
-  return compact();
+  return compactDigits(value, o.format === 'integer' ? 0 : 1);
 }
 
 export function formatAmount(value: number, o: NumberFormatOptions = {}): string {

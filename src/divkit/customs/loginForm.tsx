@@ -6,13 +6,14 @@
 // custom_props: none.
 
 import React, { useState } from 'react';
-import { ActivityIndicator, Pressable, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Text, TextInput, View } from 'react-native';
 import { colors } from '../theme';
 import type { CustomRenderer, DivHost } from '../types';
+import { Touchable } from '../../ui/touchable';
 
 function LoginForm({ host }: { host: DivHost }) {
   const c = colors(host.theme);
-  const [username, setUsername] = useState('admin');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
@@ -76,13 +77,13 @@ function LoginForm({ host }: { host: DivHost }) {
         />
       </View>
       {error ? <Text style={{ fontSize: 13, color: c.dangerFg }}>{error}</Text> : null}
-      <Pressable
+      <Touchable
         disabled={disabled}
         onPress={submit}
         style={{ backgroundColor: c.accentBg, borderRadius: 8, paddingVertical: 14, alignItems: 'center', opacity: disabled ? 0.6 : 1 }}
       >
         {submitting ? <ActivityIndicator color={c.accentFg} /> : <Text style={{ color: c.accentFg, fontWeight: '700', fontSize: 15 }}>Sign in</Text>}
-      </Pressable>
+      </Touchable>
     </View>
   );
 }

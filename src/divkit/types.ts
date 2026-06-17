@@ -101,6 +101,13 @@ export type CustomRenderer = (props: {
 export interface DivHost {
   /** Dispatch an `onec://…` (or `div-action://…`) action url. */
   fire: (url: string) => void;
+  /** Warm the cache for a nav destination on touch-down (best-effort; a no-op for
+   *  non-navigation actions), so the screen is ready by the time the tap lands. */
+  prefetch?: (url: string) => void;
+  /** The shareable web URL an `onec://…` navigation maps to (origin + path), used
+   *  by the long-press "Copy link / Open in browser" menu. Returns null for
+   *  side-effect actions (post/delete/logout/theme) — those aren't links. */
+  linkFor?: (url: string) => string | null;
   /** Read/patch card variables. */
   getVar: (name: string) => unknown;
   setVar: (name: string, value: unknown) => void;
@@ -111,4 +118,7 @@ export interface DivHost {
   /** Origin used to absolutize relative image urls. */
   baseUrl?: string;
   theme: 'light' | 'dark';
+  /** Lock/unlock the surrounding scroll surface while a child drives its own pan
+   *  gesture (maps) — RN's ScrollView won't otherwise yield to a JS PanResponder. */
+  lockScroll?: (locked: boolean) => void;
 }

@@ -12,10 +12,13 @@ import type { DivCardEnvelope, DivHost, DivVariable } from './types';
 export interface DivCardProps {
   envelope: DivCardEnvelope;
   fire: (url: string) => void;
+  prefetch?: (url: string) => void;
+  linkFor?: (url: string) => string | null;
   client: OnecClient;
   refresh?: () => void;
   baseUrl?: string;
   theme?: 'light' | 'dark';
+  lockScroll?: (locked: boolean) => void;
   /** Variables injected by the app (e.g. `active_path` for nav highlight). */
   vars?: Record<string, unknown>;
   stateId?: number;
@@ -24,10 +27,13 @@ export interface DivCardProps {
 export function DivCard({
   envelope,
   fire,
+  prefetch,
+  linkFor,
   client,
   refresh,
   baseUrl,
   theme = 'light',
+  lockScroll,
   vars: externalVars,
   stateId,
 }: DivCardProps) {
@@ -40,14 +46,17 @@ export function DivCard({
   const host: DivHost = useMemo(
     () => ({
       fire,
+      prefetch,
+      linkFor,
       client,
       refresh: refresh ?? (() => {}),
       baseUrl,
       theme,
+      lockScroll,
       getVar: (name) => vars[name],
       setVar: (name, value) => setLocalVars((v) => ({ ...v, [name]: value })),
     }),
-    [fire, client, refresh, baseUrl, theme, vars],
+    [fire, prefetch, linkFor, client, refresh, baseUrl, theme, lockScroll, vars],
   );
 
   const state = useMemo(() => {
@@ -56,8 +65,12 @@ export function DivCard({
     return chosen ? applyTemplates(chosen.div, templates) : null;
   }, [card, templates, stateId]);
 
+  // Stable ctx so the memoized Div can skip subtrees whose block + vars are
+  // unchanged (e.g. while a large container reveals its children chunk by chunk).
+  const ctx = useMemo(() => ({ vars, host }), [vars, host]);
+
   if (!state) return null;
-  return <Div block={state} ctx={{ vars, host }} />;
+  return <Div block={state} ctx={ctx} />;
 }
 
 function seedVars(vars?: DivVariable[]): Record<string, unknown> {

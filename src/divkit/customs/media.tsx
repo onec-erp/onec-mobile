@@ -6,11 +6,12 @@
 // Go-bundled pickers (expo-image-picker / expo-document-picker); no dev build needed.
 
 import React, { useState } from 'react';
-import { ActivityIndicator, Alert, Image, Linking, Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, Image, Linking, Text, View } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import type { DivHost } from '../types';
 import { colors } from '../theme';
+import { Touchable } from '../../ui/touchable';
 import { LucideIcon } from './lucide';
 
 // Client-side guard mirroring the server's onec.media.max-file-size default (10 MB); the server
@@ -104,7 +105,7 @@ export function ImageField({ value, onChange, host, variant = 'image' }: { value
 
   return (
     <View style={{ gap: 8, alignItems: avatar ? 'flex-start' : 'stretch' }}>
-      <Pressable
+      <Touchable
         onPress={choose}
         disabled={busy}
         style={{ ...box, borderWidth: 1, borderColor: c.border, borderStyle: hasImage ? 'solid' : 'dashed', backgroundColor: c.surface, alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}
@@ -122,7 +123,7 @@ export function ImageField({ value, onChange, host, variant = 'image' }: { value
             <ActivityIndicator color="#fff" />
           </View>
         ) : null}
-      </Pressable>
+      </Touchable>
       {hasImage ? (
         <View style={{ flexDirection: 'row', gap: 14 }}>
           <TextButton icon="upload" label="Replace" color={c.muted} disabled={busy} onPress={choose} />
@@ -164,13 +165,13 @@ export function GalleryField({ value, onChange, host }: { value?: string; onChan
         {urls.map((url, idx) => (
           <View key={idx} style={{ width: 96, height: 96, borderRadius: 10, overflow: 'hidden', borderWidth: 1, borderColor: c.border }}>
             <Image source={{ uri: absUrl(url, host.baseUrl) }} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
-            <Pressable
+            <Touchable
               onPress={() => removeAt(idx)}
               hitSlop={6}
               style={{ position: 'absolute', right: 4, top: 4, width: 24, height: 24, borderRadius: 6, backgroundColor: 'rgba(0,0,0,0.6)', alignItems: 'center', justifyContent: 'center' }}
             >
               <LucideIcon name="x" size={14} color="#fff" />
-            </Pressable>
+            </Touchable>
           </View>
         ))}
         {Array.from({ length: uploading }).map((_, i) => (
@@ -178,13 +179,13 @@ export function GalleryField({ value, onChange, host }: { value?: string; onChan
             <ActivityIndicator color={c.muted} />
           </View>
         ))}
-        <Pressable
+        <Touchable
           onPress={add}
           style={{ width: 96, height: 96, borderRadius: 10, borderWidth: 1, borderStyle: 'dashed', borderColor: c.border, backgroundColor: c.surface, alignItems: 'center', justifyContent: 'center', gap: 4 }}
         >
           <LucideIcon name="image-plus" size={20} color={c.muted} />
           <Text style={{ fontSize: 11, color: c.muted }}>Add</Text>
-        </Pressable>
+        </Touchable>
       </View>
       <Text style={{ fontSize: 11, color: c.muted }}>{urls.length ? `${urls.length} image${urls.length > 1 ? 's' : ''}` : 'No images yet'}</Text>
     </View>
@@ -215,21 +216,21 @@ export function FileField({ value, onChange, host }: { value?: string; onChange:
     return (
       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, borderWidth: 1, borderColor: c.border, borderRadius: 10, backgroundColor: c.surface, paddingHorizontal: 12, paddingVertical: 10 }}>
         <LucideIcon name="paperclip" size={16} color={c.muted} />
-        <Pressable style={{ flex: 1 }} onPress={() => Linking.openURL(absUrl(value!, host.baseUrl)).catch(() => {})}>
+        <Touchable style={{ flex: 1 }} onPress={() => Linking.openURL(absUrl(value!, host.baseUrl)).catch(() => {})}>
           <Text style={{ fontSize: 14, color: c.text }} numberOfLines={1}>
             {leafOf(value!)}
           </Text>
-        </Pressable>
+        </Touchable>
         {busy ? (
           <ActivityIndicator color={c.muted} />
         ) : (
           <>
-            <Pressable onPress={choose} hitSlop={6} style={{ padding: 4 }}>
+            <Touchable onPress={choose} hitSlop={6} style={{ padding: 4 }}>
               <LucideIcon name="upload" size={16} color={c.muted} />
-            </Pressable>
-            <Pressable onPress={() => onChange('')} hitSlop={6} style={{ padding: 4 }}>
+            </Touchable>
+            <Touchable onPress={() => onChange('')} hitSlop={6} style={{ padding: 4 }}>
               <LucideIcon name="trash-2" size={16} color={c.dangerFg} />
-            </Pressable>
+            </Touchable>
           </>
         )}
       </View>
@@ -237,22 +238,22 @@ export function FileField({ value, onChange, host }: { value?: string; onChange:
   }
 
   return (
-    <Pressable
+    <Touchable
       onPress={choose}
       disabled={busy}
       style={{ height: 80, borderWidth: 1, borderStyle: 'dashed', borderColor: c.border, borderRadius: 12, backgroundColor: c.surface, alignItems: 'center', justifyContent: 'center', gap: 6 }}
     >
       {busy ? <ActivityIndicator color={c.muted} /> : <LucideIcon name="file-up" size={20} color={c.muted} />}
       <Text style={{ fontSize: 12, color: c.muted }}>{busy ? 'Uploading…' : 'Choose a file'}</Text>
-    </Pressable>
+    </Touchable>
   );
 }
 
 function TextButton({ icon, label, color, disabled, onPress }: { icon: string; label: string; color: string; disabled?: boolean; onPress: () => void }) {
   return (
-    <Pressable onPress={onPress} disabled={disabled} style={{ flexDirection: 'row', alignItems: 'center', gap: 5, opacity: disabled ? 0.5 : 1 }}>
+    <Touchable onPress={onPress} disabled={disabled} style={{ flexDirection: 'row', alignItems: 'center', gap: 5, opacity: disabled ? 0.5 : 1 }}>
       <LucideIcon name={icon} size={14} color={color} />
       <Text style={{ fontSize: 12, color }}>{label}</Text>
-    </Pressable>
+    </Touchable>
   );
 }

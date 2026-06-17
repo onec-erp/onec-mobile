@@ -4,10 +4,11 @@
 // constants-editor.tsx. custom_props: { title, names?: string[] }.
 
 import React, { useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, Switch, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Alert, Switch, Text, TextInput, View } from 'react-native';
 import type { Row, SettingMeta } from '../../api/onecClient';
 import { colors } from '../theme';
 import type { CustomRenderer, DivHost } from '../types';
+import { Touchable } from '../../ui/touchable';
 
 const isBool = (t: string) => /^(boolean|Boolean)$/.test(t);
 const isNum = (t: string) => /^(Integer|Long|Double|Float|Short|BigDecimal|int|long|double)$/.test(t);
@@ -139,7 +140,7 @@ function ConstantsEditor({ host, title, names }: { host: DivHost; title?: string
             ))}
           </View>
           <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 14 }}>
-            <Pressable
+            <Touchable
               disabled={saving || !dirty}
               onPress={save}
               style={{
@@ -151,7 +152,7 @@ function ConstantsEditor({ host, title, names }: { host: DivHost; title?: string
               }}
             >
               <Text style={{ color: c.accentFg, fontSize: 14, fontWeight: '600' }}>{saving ? 'Saving…' : 'Save changes'}</Text>
-            </Pressable>
+            </Touchable>
           </View>
         </>
       )}

@@ -2,10 +2,11 @@
 // View / Text / Image / ScrollView. Templates are resolved up front; @{…}
 // expressions in this node's own props are resolved here against the variables.
 
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Image, Pressable, ScrollView, Text, View } from 'react-native';
 import type { StyleProp, ViewStyle } from 'react-native';
 import { resolve, resolveString, type Variables } from './expr';
+import { ContextMenuArea, hasLinkMenu } from './longPress';
 import { CustomPlaceholder, getCustom } from './registry';
 import { boxStyle, color, containerStyle, textStyle } from './style';
 import type { DivAction, DivBlock, DivHost } from './types';
@@ -15,7 +16,7 @@ interface Ctx {
   host: DivHost;
 }
 
-export function Div({ block: rawBlock, ctx }: { block: DivBlock; ctx: Ctx }): React.ReactElement | null {
+function DivImpl({ block: rawBlock, ctx }: { block: DivBlock; ctx: Ctx }): React.ReactElement | null {
   if (!rawBlock || typeof rawBlock !== 'object') return null;
   // Resolve @{…} in this node's own props (colors, text, sizes, action urls).
   // Children resolve themselves; custom_props are left to the custom renderer.
@@ -37,27 +38,50 @@ export function Div({ block: rawBlock, ctx }: { block: DivBlock; ctx: Ctx }): Re
         }
       }
     : undefined;
+  // Warm the destination on touch-down so it's usually ready by the time the tap
+  // completes (best-effort; the host ignores non-navigation action urls).
+  const onPressIn =
+    actions.length && ctx.host.prefetch
+      ? () => {
+          for (const a of actions) {
+            const url = resolveString(a.url, ctx.vars);
+            if (url) ctx.host.prefetch!(url);
+          }
+        }
+      : undefined;
+  // Long-press = the web's right-click: a Copy link / Open in browser menu. Only
+  // the first action that is a navigable link gets one, so non-link actions
+  // (post/delete/…) keep their plain tap. `host` is threaded alongside so the
+  // tappable element can be wrapped in <ContextMenuArea> (the gesture lives there).
+  const menuUrl = actions.length
+    ? actions.map((a) => resolveString(a.url, ctx.vars)).find((u) => u && hasLinkMenu(ctx.host, u))
+    : undefined;
 
   switch (block.type) {
     case 'text': {
-      const node = (
-        <Text style={[textStyle(block), boxStyle(block)]} numberOfLines={block.max_lines}>
+      // When tappable, the Pressable IS the layout box — it carries the weight/flex
+      // and margins, and the Text keeps only its text styling. Otherwise a weighted
+      // ref link (a tappable value with weight) collapses to its content width and the
+      // label cell's weight shoves it to the right edge instead of filling the row.
+      const text = (
+        <Text style={[textStyle(block), onPress ? null : boxStyle(block)]} numberOfLines={block.max_lines}>
           {resolveString(block.text, ctx.vars)}
         </Text>
       );
       return onPress ? (
-        <Pressable onPress={onPress} style={({ pressed }) => (pressed ? { opacity: 0.6 } : null)}>
-          {node}
-        </Pressable>
+        <ContextMenuArea host={ctx.host} url={menuUrl}>
+          <Pressable onPress={onPress} onPressIn={onPressIn} style={({ pressed }) => [boxStyle(block), pressed ? { opacity: 0.6 } : null]}>
+            {text}
+          </Pressable>
+        </ContextMenuArea>
       ) : (
-        node
+        text
       );
     }
 
     case 'image': {
       const uri = absolutize(resolveString(block.image_url, ctx.vars), ctx.host.baseUrl);
-      const img = <Image source={{ uri }} style={[{ width: 40, height: 40 }, baseStyle] as any} resizeMode="cover" />;
-      return onPress ? <Pressable onPress={onPress}>{img}</Pressable> : img;
+      return <DivImage uri={uri} style={[{ width: 40, height: 40 }, baseStyle]} onPress={onPress} onPressIn={onPressIn} host={ctx.host} menuUrl={menuUrl} />;
     }
 
     case 'separator': {
@@ -90,7 +114,7 @@ export function Div({ block: rawBlock, ctx }: { block: DivBlock; ctx: Ctx }): Re
     case 'grid': {
       const cols = block.column_count ?? 2;
       return (
-        <Box style={[{ flexDirection: 'row', flexWrap: 'wrap' }, baseStyle]} onPress={onPress}>
+        <Box style={[{ flexDirection: 'row', flexWrap: 'wrap' }, baseStyle]} onPress={onPress} onPressIn={onPressIn} host={ctx.host} menuUrl={menuUrl}>
           {(block.items ?? []).map((c, i) => (
             <View key={i} style={{ width: `${100 / cols}%` }}>
               <Div block={c} ctx={ctx} />
@@ -103,7 +127,7 @@ export function Div({ block: rawBlock, ctx }: { block: DivBlock; ctx: Ctx }): Re
     case 'state': {
       const states = (block.states as Array<{ div: DivBlock }>) ?? [];
       const inner = states.length ? <Div block={states[0].div} ctx={ctx} /> : null;
-      return onPress ? <Box style={baseStyle} onPress={onPress}>{inner}</Box> : inner;
+      return onPress ? <Box style={baseStyle} onPress={onPress} onPressIn={onPressIn} host={ctx.host} menuUrl={menuUrl}>{inner}</Box> : inner;
     }
 
     case 'custom': {
@@ -112,38 +136,104 @@ export function Div({ block: rawBlock, ctx }: { block: DivBlock; ctx: Ctx }): Re
       const inner = renderer
         ? renderer({ block, customProps: block.custom_props ?? {}, host: ctx.host })
         : <CustomPlaceholder type={type} />;
-      return <Box style={baseStyle} onPress={onPress}>{inner}</Box>;
+      return <Box style={baseStyle} onPress={onPress} onPressIn={onPressIn} host={ctx.host} menuUrl={menuUrl}>{inner}</Box>;
     }
 
     case 'container':
     default:
       return (
-        <Box style={[containerStyle(block), baseStyle]} onPress={onPress}>
-          {(block.items ?? []).map((c, i) => (
-            <Div key={i} block={c} ctx={ctx} />
-          ))}
+        <Box style={[containerStyle(block), baseStyle]} onPress={onPress} onPressIn={onPressIn} host={ctx.host} menuUrl={menuUrl}>
+          {renderChildren(block.items ?? [], ctx)}
         </Box>
       );
   }
 }
 
+// Memoized so a re-render that doesn't change a subtree's block or ctx (vars)
+// skips it — e.g. while a large container reveals its children chunk by chunk,
+// the already-mounted children don't re-render.
+export const Div = React.memo(DivImpl);
+
+const CHUNK_FIRST = 12; // children rendered on the first frame
+const CHUNK_STEP = 40; // children added per subsequent frame
+
+/** Render a container's children. Small lists render directly; large ones mount
+ *  progressively (a chunk per frame) so a heavy section never blocks the thread.
+ *  Memoized Div keeps each step O(newly-revealed children). */
+function renderChildren(items: DivBlock[], ctx: Ctx): React.ReactNode {
+  if (items.length <= CHUNK_FIRST) {
+    return items.map((c, i) => <Div key={i} block={c} ctx={ctx} />);
+  }
+  return <ChunkedChildren items={items} ctx={ctx} />;
+}
+
+function ChunkedChildren({ items, ctx }: { items: DivBlock[]; ctx: Ctx }) {
+  const [limit, setLimit] = useState(CHUNK_FIRST);
+  useEffect(() => {
+    if (limit >= items.length) return;
+    const raf = requestAnimationFrame(() => setLimit((n) => Math.min(n + CHUNK_STEP, items.length)));
+    return () => cancelAnimationFrame(raf);
+  }, [limit, items.length]);
+  return (
+    <>
+      {items.slice(0, limit).map((c, i) => (
+        <Div key={i} block={c} ctx={ctx} />
+      ))}
+    </>
+  );
+}
+
 /** A layout box that becomes a Pressable (carrying the same style → same flex)
- *  when given an onPress, else a plain View. */
+ *  when given an onPress, else a plain View. Wrapped in <ContextMenuArea> when its
+ *  action is a link, so a long-press opens the Copy link / Open in browser menu. */
 function Box({
   style,
   onPress,
+  onPressIn,
+  host,
+  menuUrl,
   children,
 }: {
   style: StyleProp<ViewStyle>;
   onPress?: () => void;
+  onPressIn?: () => void;
+  host?: DivHost;
+  menuUrl?: string;
   children: React.ReactNode;
 }) {
   if (!onPress) return <View style={style}>{children}</View>;
-  return (
-    <Pressable onPress={onPress} style={({ pressed }) => [style, pressed ? { opacity: 0.6 } : null]}>
+  const press = (
+    <Pressable onPress={onPress} onPressIn={onPressIn} style={({ pressed }) => [style, pressed ? { opacity: 0.6 } : null]}>
       {children}
     </Pressable>
   );
+  return host ? <ContextMenuArea host={host} url={menuUrl}>{press}</ContextMenuArea> : press;
+}
+
+// An image that collapses (renders nothing) if it fails to load, so a broken or
+// offline url doesn't leave an empty sized box — e.g. the menu's brand logo when
+// the device is offline, which otherwise reads as a large gap above the content.
+function DivImage({
+  uri,
+  style,
+  onPress,
+  onPressIn,
+  host,
+  menuUrl,
+}: {
+  uri: string;
+  style: StyleProp<ViewStyle>;
+  onPress?: () => void;
+  onPressIn?: () => void;
+  host?: DivHost;
+  menuUrl?: string;
+}) {
+  const [failed, setFailed] = useState(false);
+  if (failed || !uri) return null;
+  const img = <Image source={{ uri }} style={style as any} resizeMode="cover" onError={() => setFailed(true)} />;
+  if (!onPress) return img;
+  const press = <Pressable onPress={onPress} onPressIn={onPressIn}>{img}</Pressable>;
+  return host ? <ContextMenuArea host={host} url={menuUrl}>{press}</ContextMenuArea> : press;
 }
 
 // Shallow-deep resolve of a node's own expression-bearing props. Skips `items`

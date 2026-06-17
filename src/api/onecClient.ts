@@ -4,9 +4,14 @@
 //
 // CSRF: the server sets a non-HttpOnly `XSRF-TOKEN` cookie and requires it
 // echoed as `X-XSRF-TOKEN` on every mutating request. Native fetch manages the
-// (HttpOnly) session cookie automatically, but we must read the XSRF token
-// ourselves — we parse it out of the `Set-Cookie` response header (no native
-// cookie module, so this works in Expo Go).
+// (HttpOnly) session cookie automatically. Reading the token back is the hard part:
+// on Android/web we can scrape it from the `Set-Cookie` response header (see
+// captureCsrf), but iOS never exposes Set-Cookie to JS and there is no
+// `document.cookie` — so we fetch the token from `GET /api/auth/csrf` (see
+// ensureCsrf), which works on every platform without a native cookie module.
+
+import { toast } from '../ui/toast';
+import { clearCredentials, saveCredentials } from './credentials';
 
 export interface AuthUser {
   authenticated: boolean;
@@ -46,10 +51,32 @@ export interface UploadFile {
   type: string;
 }
 
-export class OnecAuthError extends Error {}
+export class OnecAuthError extends Error {
+  /** HTTP status that caused it — 401 = bad credentials, 403 = CSRF rejection, etc. Lets
+   *  callers distinguish "these creds are wrong" (forget them) from a transient/CSRF failure. */
+  constructor(message: string, public status?: number) {
+    super(message);
+  }
+}
 export class OnecRequestError extends Error {
   constructor(public path: string, public status: number) {
     super(`Request to ${path} failed (HTTP ${status})`);
+  }
+}
+
+/**
+ * A failed mutating request. Carries the parsed JSON error body (`data`) so a form can read
+ * `data.fieldErrors`, plus a readable `message` (server `message`/`error`, else a fallback) for
+ * the toast. Mirrors the web client's `ApiError`.
+ */
+export class ApiError extends Error {
+  constructor(public path: string, public status: number, public data?: any) {
+    super((data && (data.message || data.error)) || `Request to ${path} failed (HTTP ${status})`);
+  }
+  /** Inline field-level validation errors (a 422), if any — shown by the form, not toasted. */
+  get fieldErrors(): Record<string, string[]> | undefined {
+    const fe = this.data?.fieldErrors;
+    return fe && typeof fe === 'object' && Object.keys(fe).length ? fe : undefined;
   }
 }
 
@@ -57,6 +84,14 @@ const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 export class OnecClient {
   private csrf: string | null = null;
+  /** Per-server stale-while-revalidate cache for GET reads (content/list/rows).
+   *  Lets a screen paint last-known data instantly; cleared on any successful
+   *  mutating request so writes are always reflected. */
+  private cache = new Map<string, { v: unknown; ts: number }>();
+  /** Within this window a cached read is served WITHOUT revalidating — so quick
+   *  back-and-forth navigation costs no network and no re-render. SSE pushes and
+   *  local writes still force fresh data (the cache is cleared / refresh forced). */
+  private static readonly CACHE_TTL_MS = 30_000;
 
   constructor(public baseUrl: string) {}
 
@@ -67,8 +102,31 @@ export class OnecClient {
     opts: { method?: string; body?: unknown; query?: Record<string, string | undefined> } = {},
   ): Promise<Response> {
     const method = (opts.method ?? 'GET').toUpperCase();
-    const url = this.baseUrl.replace(/\/$/, '') + path + queryString(opts.query);
+    // Mutations must echo the CSRF token in a header. On iOS we can't read it from
+    // the XSRF-TOKEN cookie (Set-Cookie is hidden from JS, no document.cookie), so
+    // fetch it from /api/auth/csrf first when we don't already have one.
+    if (MUTATING.has(method) && !this.csrf) await this.ensureCsrf();
 
+    let res = await this.send(method, path, opts);
+    // A 403 on a write is usually a missing/stale token (e.g. the session rotated).
+    // Refetch once and retry before surfacing the failure.
+    if (MUTATING.has(method) && res.status === 403) {
+      await this.ensureCsrf();
+      res = await this.send(method, path, opts);
+    }
+
+    // A successful write invalidates everything we've cached — drop it so the
+    // next read revalidates against the server.
+    if (MUTATING.has(method) && ok(res)) this.cache.clear();
+    return res;
+  }
+
+  private async send(
+    method: string,
+    path: string,
+    opts: { body?: unknown; query?: Record<string, string | undefined> },
+  ): Promise<Response> {
+    const url = this.baseUrl.replace(/\/$/, '') + path + queryString(opts.query);
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
     if (MUTATING.has(method) && this.csrf) headers['X-XSRF-TOKEN'] = this.csrf;
@@ -79,23 +137,84 @@ export class OnecClient {
       credentials: 'include',
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
     });
-
     this.captureCsrf(res);
     return res;
   }
 
-  /** Pull the rotating XSRF token out of the Set-Cookie response header. */
+  /**
+   * Obtain the session's CSRF token. Browsers read it from the non-HttpOnly XSRF-TOKEN
+   * cookie (see captureCsrf), but native fetch on iOS never exposes Set-Cookie, so we
+   * ask the server for it via `GET /api/auth/csrf` (added in onec-auth-starter). Best
+   * effort: on failure the pending mutation just fails loudly with the real error.
+   */
+  private async ensureCsrf(): Promise<void> {
+    try {
+      const res = await fetch(this.baseUrl.replace(/\/$/, '') + '/api/auth/csrf', {
+        headers: { Accept: 'application/json' },
+        credentials: 'include',
+      });
+      this.captureCsrf(res); // Android/web: token may arrive via Set-Cookie too.
+      if (ok(res)) {
+        const data = (await res.json()) as { token?: string | null };
+        if (data?.token) this.csrf = data.token;
+      }
+    } catch {
+      /* offline / unreachable — the mutation that needs the token will report it */
+    }
+  }
+
+  /**
+   * Pull the rotating XSRF token out of the Set-Cookie response header(s).
+   *
+   * RN/fetch expose multi-valued Set-Cookie inconsistently — and this bites with
+   * servers behind a load balancer that prepend their own cookie (e.g. an affinity
+   * cookie) *before* XSRF-TOKEN. So we try every shape: the standard multi-value
+   * `getSetCookie()`, the spec-merged single string, and RN's internal header map —
+   * scanning each for the token rather than trusting one accessor.
+   */
   private captureCsrf(res: Response): void {
-    const setCookie = res.headers.get('set-cookie');
-    if (!setCookie) return;
-    const m = setCookie.match(/XSRF-TOKEN=([^;,\s]+)/);
-    if (m) this.csrf = m[1];
+    const h = res.headers as any;
+    const sources: Array<string | null | undefined> = [];
+    if (typeof h.getSetCookie === 'function') {
+      try {
+        sources.push(...h.getSetCookie());
+      } catch {
+        /* ignore */
+      }
+    }
+    sources.push(res.headers.get('set-cookie'));
+    if (h.map) sources.push(h.map['set-cookie']);
+    for (const s of sources) {
+      const m = s && s.match(/XSRF-TOKEN=([^;,\s]+)/);
+      if (m) {
+        this.csrf = m[1];
+        return;
+      }
+    }
   }
 
   private async json<T>(path: string, query?: Record<string, string | undefined>): Promise<T> {
     const res = await this.request(path, { query });
     if (res.status !== 200) throw new OnecRequestError(path, res.status);
     return (await res.json()) as T;
+  }
+
+  /**
+   * Throw (and toast) when a mutating response failed. Parses the JSON error body into an
+   * `ApiError`. Like the web's `fetchJson`, a 401 (lapsed session) and a field-level validation
+   * 422 are NOT toasted — the form shows field errors inline; everything else surfaces a toast.
+   */
+  private async ensureOk(res: Response, path: string): Promise<void> {
+    if (ok(res)) return;
+    let data: any;
+    try {
+      data = await res.json();
+    } catch {
+      /* non-JSON / empty body */
+    }
+    const err = new ApiError(path, res.status, data);
+    if (res.status !== 401 && !err.fieldErrors) toast.error(err.message);
+    throw err;
   }
 
   // ----- auth -----
@@ -107,35 +226,111 @@ export class OnecClient {
   }
 
   async login(username: string, password: string): Promise<AuthUser> {
-    // Seed the session + CSRF cookie before the (mutating) login POST.
-    if (!this.csrf) await this.me();
+    // Always re-seed the session + CSRF cookie immediately before the (mutating)
+    // login POST, so the X-XSRF-TOKEN header and the cookie the OS sends are freshly
+    // in sync — not a possibly-stale token captured earlier.
+    await this.me();
     const res = await this.request('/api/auth/login', {
       method: 'POST',
       body: { username, password },
     });
-    if (res.status === 200) return normalizeUser(await res.json());
-    if (res.status === 401) throw new OnecAuthError('Invalid username or password');
-    throw new OnecAuthError(`Login failed (HTTP ${res.status})`);
+    if (res.status === 200) {
+      const user = normalizeUser(await res.json());
+      // Remember the credentials so the next launch can auto sign in (the session
+      // cookie won't survive a relaunch on iOS). Centralized here so every login
+      // path persists consistently — the native fallback form, the onec-login-form
+      // custom on the server-driven card, and the auto-login replay on connect.
+      await saveCredentials(this.baseUrl, username, password);
+      return user;
+    }
+    if (res.status === 401) throw new OnecAuthError('Invalid username or password', 401);
+    // 403 here is a CSRF rejection (the server enforces it), not bad credentials —
+    // it means the app couldn't read/echo the XSRF-TOKEN cookie for this server.
+    if (res.status === 403) throw new OnecAuthError('Security check failed (CSRF, HTTP 403) — the app couldn’t read this server’s XSRF-TOKEN cookie.', 403);
+    throw new OnecAuthError(`Login failed (HTTP ${res.status})`, res.status);
   }
 
   async logout(): Promise<void> {
-    await this.request('/api/auth/logout', { method: 'POST' });
+    try {
+      await this.request('/api/auth/logout', { method: 'POST' });
+    } finally {
+      // Forget the saved credentials too — an explicit logout means "don't auto
+      // sign me back in", so the next connect must land on the login screen.
+      await clearCredentials(this.baseUrl);
+    }
+  }
+
+  /**
+   * The server-driven login screen as a DivKit card (`GET /api/divkit/login`). Public — it renders
+   * before sign-in. Describes whatever this server offers: a password sub-form (the `onec-login-form`
+   * custom) and/or one button per SSO provider. The client just renders + routes its actions.
+   */
+  loginCard(o: { theme?: 'light' | 'dark' } = {}): Promise<{ templates?: Record<string, unknown>; card: unknown }> {
+    return this.json('/api/divkit/login', { theme: o.theme ?? 'light' });
+  }
+
+  // ----- read cache (stale-while-revalidate) -----
+
+  private contentKey(path: string, o: { viewport?: string; theme?: string; profile?: string }): string {
+    return `content|${o.viewport ?? 'mobile'}|${o.theme ?? 'light'}|${o.profile ?? ''}|${path}`;
+  }
+  private listKey(kind: string, name: string, o: { q?: string; limit?: number; offset?: number; sort?: string; descending?: boolean }): string {
+    return `list|${kind}|${name}|q=${o.q ?? ''}|sort=${o.sort ?? ''}|dir=${o.sort ? (o.descending ? 'desc' : 'asc') : ''}|limit=${o.limit ?? 100}|offset=${o.offset ?? 0}`;
+  }
+  private rowsKey(kind: string, name: string, o: { from?: string; to?: string; registerPath?: string }): string {
+    return `rows|${kind}|${name}|${o.registerPath ?? ''}|${o.from ?? ''}|${o.to ?? ''}`;
+  }
+
+  /** Synchronous cache reads — let a component paint last-known data on its first
+   *  render. `undefined` = miss. */
+  peekContent(path: string, o: { viewport?: string; theme?: string; profile?: string } = {}) {
+    return this.cache.get(this.contentKey(path, o))?.v as { templates?: Record<string, unknown>; card: unknown } | undefined;
+  }
+  peekListRows(kind: string, name: string, o: { q?: string; limit?: number; offset?: number; sort?: string; descending?: boolean } = {}) {
+    return this.cache.get(this.listKey(kind, name, o))?.v as { total: number; offset: number; rows: Row[] } | undefined;
+  }
+  peekRows(kind: string, name: string, o: { from?: string; to?: string; registerPath?: string } = {}) {
+    return this.cache.get(this.rowsKey(kind, name, o))?.v as Row[] | undefined;
+  }
+
+  /** Whether a cached read is recent enough to skip revalidation (see CACHE_TTL_MS).
+   *  Navigation/mount uses this to avoid the re-fetch + re-render churn on quick
+   *  revisits; an explicit refresh ignores it. */
+  private freshAt(key: string): boolean {
+    const e = this.cache.get(key);
+    return !!e && Date.now() - e.ts < OnecClient.CACHE_TTL_MS;
+  }
+  freshContent(path: string, o: { viewport?: string; theme?: string; profile?: string } = {}) {
+    return this.freshAt(this.contentKey(path, o));
+  }
+  freshListRows(kind: string, name: string, o: { q?: string; limit?: number; offset?: number; sort?: string; descending?: boolean } = {}) {
+    return this.freshAt(this.listKey(kind, name, o));
+  }
+  freshRows(kind: string, name: string, o: { from?: string; to?: string; registerPath?: string } = {}) {
+    return this.freshAt(this.rowsKey(kind, name, o));
+  }
+
+  /** Store a read result with a fresh timestamp. */
+  private store(key: string, v: unknown): void {
+    this.cache.set(key, { v, ts: Date.now() });
   }
 
   // ----- DivKit cards -----
 
   /** Content card for an app route. `/` → the dashboard (`/home`). */
-  content(
+  async content(
     path: string,
     o: { viewport?: string; theme?: string; profile?: string } = {},
   ): Promise<{ templates?: Record<string, unknown>; card: unknown }> {
     const isHome = path === '/' || path === '';
     const url = isHome ? '/api/divkit/home' : `/api/divkit${path}`;
-    return this.json(url, {
+    const env = await this.json<{ templates?: Record<string, unknown>; card: unknown }>(url, {
       viewport: o.viewport ?? 'mobile',
       theme: o.theme ?? 'light',
       profile: o.profile,
     });
+    this.store(this.contentKey(path, o), env);
+    return env;
   }
 
   /** Chrome card set: `{ navStyle, home, nav, account }`. */
@@ -167,11 +362,13 @@ export class OnecClient {
       sort: o.sort || undefined,
       dir: o.sort ? (o.descending ? 'desc' : 'asc') : undefined,
     });
-    return {
+    const result = {
       total: Number(data?.total ?? 0),
       offset: Number(data?.offset ?? o.offset ?? 0),
       rows: asRows(data?.rows),
     };
+    this.store(this.listKey(kind, name, o), result);
+    return result;
   }
 
   /** Full row set: `GET /api/{kind}/{name}` (or a register's movements/turnover). */
@@ -183,7 +380,9 @@ export class OnecClient {
     const path = o.registerPath ? `/api/registers/${name}/${o.registerPath}` : `/api/${kind}/${name}`;
     const res = await this.request(path, { query: { from: o.from, to: o.to } });
     if (res.status !== 200) throw new OnecRequestError(path, res.status);
-    return asRows(await res.json());
+    const result = asRows(await res.json());
+    this.store(this.rowsKey(kind, name, o), result);
+    return result;
   }
 
   /** Typeahead for a ref picker: `GET /api/{kind}/{name}?q=&limit=`. */
@@ -193,29 +392,29 @@ export class OnecClient {
 
   async createEntity(kind: string, name: string, body: Row): Promise<Row> {
     const res = await this.request(`/api/${kind}/${name}`, { method: 'POST', body });
-    if (!ok(res)) throw new OnecRequestError(`/api/${kind}/${name}`, res.status);
+    await this.ensureOk(res, `/api/${kind}/${name}`);
     return (await res.json()) as Row;
   }
 
   async updateEntity(kind: string, name: string, id: string, body: Row): Promise<Row> {
     const res = await this.request(`/api/${kind}/${name}/${id}`, { method: 'PUT', body });
-    if (!ok(res)) throw new OnecRequestError(`/api/${kind}/${name}/${id}`, res.status);
+    await this.ensureOk(res, `/api/${kind}/${name}/${id}`);
     return (await res.json()) as Row;
   }
 
   async deleteEntity(kind: string, name: string, id: string): Promise<void> {
     const res = await this.request(`/api/${kind}/${name}/${id}`, { method: 'DELETE' });
-    if (!ok(res)) throw new OnecRequestError(`/api/${kind}/${name}/${id}`, res.status);
+    await this.ensureOk(res, `/api/${kind}/${name}/${id}`);
   }
 
   async postDocument(name: string, id: string): Promise<void> {
     const res = await this.request(`/api/documents/${name}/${id}/post`, { method: 'POST' });
-    if (!ok(res)) throw new OnecRequestError(`/api/documents/${name}/${id}/post`, res.status);
+    await this.ensureOk(res, `/api/documents/${name}/${id}/post`);
   }
 
   async unpostDocument(name: string, id: string): Promise<void> {
     const res = await this.request(`/api/documents/${name}/${id}/unpost`, { method: 'POST' });
-    if (!ok(res)) throw new OnecRequestError(`/api/documents/${name}/${id}/unpost`, res.status);
+    await this.ensureOk(res, `/api/documents/${name}/${id}/unpost`);
   }
 
   /** Run a custom list/detail action: `POST /api/actions/{kind}/{name}/{key}[?id=]`. */
@@ -230,7 +429,7 @@ export class OnecClient {
       query: { id: o.id },
       body: { inputs: o.inputs },
     });
-    if (!ok(res)) throw new OnecRequestError(`/api/actions/${kind}/${name}/${key}`, res.status);
+    await this.ensureOk(res, `/api/actions/${kind}/${name}/${key}`);
     const m = (await res.json()) as any;
     return { message: m?.message, navigate: m?.navigate, refresh: m?.refresh === true };
   }
@@ -246,13 +445,13 @@ export class OnecClient {
       method: 'POST',
       body: { body },
     });
-    if (!ok(res)) throw new OnecRequestError(`/api/comments/${kind}/${name}/${id}`, res.status);
+    await this.ensureOk(res, `/api/comments/${kind}/${name}/${id}`);
     return (await res.json()) as Row;
   }
 
   async deleteComment(commentId: string): Promise<void> {
     const res = await this.request(`/api/comments/${commentId}`, { method: 'DELETE' });
-    if (!ok(res)) throw new OnecRequestError(`/api/comments/${commentId}`, res.status);
+    await this.ensureOk(res, `/api/comments/${commentId}`);
   }
 
   // ----- app settings (framework @Constant values, admin-only — onec-constants) -----
@@ -265,7 +464,7 @@ export class OnecClient {
   /** Persist changed settings in place: `PUT /api/settings` with a `{ name: value }` map. */
   async saveSettings(values: Row): Promise<void> {
     const res = await this.request('/api/settings', { method: 'PUT', body: values });
-    if (!ok(res)) throw new OnecRequestError('/api/settings', res.status);
+    await this.ensureOk(res, '/api/settings');
   }
 
   // ----- page-level action buttons (PageBuilder.actions — onec-actions) -----
@@ -281,7 +480,7 @@ export class OnecClient {
       query: { route, key, profile },
       body: { inputs: inputs ?? {} },
     });
-    if (!ok(res)) throw new OnecRequestError('/api/divkit/page-action', res.status);
+    await this.ensureOk(res, '/api/divkit/page-action');
     const m = (await res.json()) as any;
     return { message: m?.message, navigate: m?.navigate, refresh: m?.refresh === true };
   }
@@ -308,7 +507,7 @@ export class OnecClient {
       body: form,
     });
     this.captureCsrf(res);
-    if (!ok(res)) throw new OnecRequestError('/api/media', res.status);
+    await this.ensureOk(res, '/api/media');
     return (await res.json()) as StoredMedia;
   }
 }

@@ -4,9 +4,10 @@
 // { heading, route, profile, buttons: [{ key, label, icon?, logo?, server, url? }] }.
 
 import React, { useState } from 'react';
-import { ActivityIndicator, Alert, Image, Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, Image, Text, View } from 'react-native';
 import { colors } from '../theme';
 import type { CustomRenderer } from '../types';
+import { Touchable } from '../../ui/touchable';
 import { LucideIcon } from './lucide';
 
 interface ActionButton {
@@ -63,7 +64,7 @@ export const onecActions: CustomRenderer = ({ customProps, host }) => {
           const busy = !!pending[b.key];
           const logo = absolutize(b.logo, host.baseUrl);
           return (
-            <Pressable
+            <Touchable
               key={b.key}
               disabled={busy}
               onPress={() => run(b)}
@@ -88,7 +89,7 @@ export const onecActions: CustomRenderer = ({ customProps, host }) => {
                 <LucideIcon name={b.icon} size={16} color={c.text} />
               ) : null}
               <Text style={{ fontSize: 13, fontWeight: '600', color: c.text }}>{b.label}</Text>
-            </Pressable>
+            </Touchable>
           );
         })}
       </View>

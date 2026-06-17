@@ -4,9 +4,6 @@
 
 import { useState } from 'react';
 import {
-  KeyboardAvoidingView,
-  Platform,
-  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -15,6 +12,7 @@ import {
 } from 'react-native';
 import { normalizeUrl, type ServerEntry } from './api/servers';
 import { colors } from './divkit/theme';
+import { Touchable } from './ui/touchable';
 
 interface Props {
   theme: 'light' | 'dark';
@@ -42,15 +40,15 @@ export function ConnectScreen({ theme, servers, bottomInset = 0, onConnect, onRe
   }
 
   return (
-    <KeyboardAvoidingView
+    <ScrollView
       style={[styles.flex, { backgroundColor: c.bg }]}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      contentContainerStyle={[styles.content, { paddingBottom: 24 + bottomInset }]}
+      keyboardShouldPersistTaps="handled"
+      keyboardDismissMode="interactive"
+      // Lift the URL field above the keyboard (iOS) instead of letting it hide behind it.
+      automaticallyAdjustKeyboardInsets
     >
-      <ScrollView
-        contentContainerStyle={[styles.content, { paddingBottom: 24 + bottomInset }]}
-        keyboardShouldPersistTaps="handled"
-      >
-        <Text style={[styles.title, { color: c.text }]}>Connect to a server</Text>
+      <Text style={[styles.title, { color: c.text }]}>Connect to a server</Text>
         <Text style={[styles.subtitle, { color: c.muted }]}>
           Pick a OneC server or add a new one.
         </Text>
@@ -79,7 +77,7 @@ export function ConnectScreen({ theme, servers, bottomInset = 0, onConnect, onRe
               },
             ]}
           />
-          <Pressable
+          <Touchable
             onPress={submit}
             disabled={draft.trim() === ''}
             style={[
@@ -88,7 +86,7 @@ export function ConnectScreen({ theme, servers, bottomInset = 0, onConnect, onRe
             ]}
           >
             <Text style={[styles.addBtnText, { color: c.accentFg }]}>Connect</Text>
-          </Pressable>
+          </Touchable>
         </View>
         {invalid && (
           <Text style={[styles.fieldError, { color: c.dangerFg }]}>
@@ -107,7 +105,7 @@ export function ConnectScreen({ theme, servers, bottomInset = 0, onConnect, onRe
             </Text>
           ) : (
             servers.map((s, i) => (
-              <Pressable
+              <Touchable
                 key={s.url}
                 onPress={() => onConnect(s.url)}
                 style={[
@@ -120,15 +118,14 @@ export function ConnectScreen({ theme, servers, bottomInset = 0, onConnect, onRe
                     {s.label}
                   </Text>
                 </View>
-                <Pressable onPress={() => onRemove(s.url)} hitSlop={10} style={styles.remove}>
+                <Touchable onPress={() => onRemove(s.url)} hitSlop={10} style={styles.remove}>
                   <Text style={[styles.removeText, { color: c.muted }]}>✕</Text>
-                </Pressable>
-              </Pressable>
+                </Touchable>
+              </Touchable>
             ))
           )}
         </View>
-      </ScrollView>
-    </KeyboardAvoidingView>
+    </ScrollView>
   );
 }
 

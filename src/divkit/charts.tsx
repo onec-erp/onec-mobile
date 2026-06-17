@@ -60,6 +60,62 @@ export function resolveColor(override: string | undefined, theme: 'light' | 'dar
   return resolveColors(1, override, theme, c)[0];
 }
 
+// ----- smooth curve (monotone cubic, mirrors recharts' type="monotone") -----
+
+// Fritsch–Carlson monotone cubic interpolation, the same curve d3-shape's
+// `curveMonotoneX` (and therefore recharts) draws: smooth through every point
+// but guaranteed not to overshoot, so a sparkline never dips below its own min.
+// Emits an SVG path of one `M` + cubic `C` segments through the given points.
+type Pt = readonly [number, number];
+
+const sign = (x: number) => (x < 0 ? -1 : 1);
+
+// Tangent at an interior point from the slopes of its two neighbouring segments.
+function slope3(p0: Pt, p1: Pt, p2: Pt): number {
+  const h0 = p1[0] - p0[0];
+  const h1 = p2[0] - p1[0];
+  const s0 = (p1[1] - p0[1]) / (h0 || (h1 < 0 ? -0 : 1e-9));
+  const s1 = (p2[1] - p1[1]) / (h1 || (h0 < 0 ? -0 : 1e-9));
+  const p = (s0 * h1 + s1 * h0) / (h0 + h1);
+  return (sign(s0) + sign(s1)) * Math.min(Math.abs(s0), Math.abs(s1), 0.5 * Math.abs(p)) || 0;
+}
+
+// Endpoint tangent (one-sided), given the interior tangent next to it.
+function slope2(p0: Pt, p1: Pt, t: number): number {
+  const h = p1[0] - p0[0];
+  return h ? (3 * ((p1[1] - p0[1]) / h) - t) / 2 : t;
+}
+
+function bezierTo(p0: Pt, p1: Pt, t0: number, t1: number): string {
+  const dx = (p1[0] - p0[0]) / 3;
+  return `C${(p0[0] + dx).toFixed(2)} ${(p0[1] + dx * t0).toFixed(2)} ${(p1[0] - dx).toFixed(2)} ${(p1[1] - dx * t1).toFixed(2)} ${p1[0].toFixed(2)} ${p1[1].toFixed(2)}`;
+}
+
+// The curve commands AFTER the initial point — i.e. the `C…`/`L` that draw from
+// pts[0] through pts[n-1]. Split out so a stacked area can trace its top edge
+// forward and its (already-positioned) bottom edge backward without a stray `M`.
+function monotoneSegments(pts: Pt[]): string {
+  const n = pts.length;
+  if (n < 2) return '';
+  if (n === 2) return `L${pts[1][0].toFixed(2)} ${pts[1][1].toFixed(2)}`;
+  let d = '';
+  let t0 = NaN;
+  for (let i = 2; i < n; i++) {
+    const t1 = slope3(pts[i - 2], pts[i - 1], pts[i]); // tangent at pts[i-1]
+    const startT = i === 2 ? slope2(pts[0], pts[1], t1) : t0; // tangent at pts[i-2]
+    d += (d ? ' ' : '') + bezierTo(pts[i - 2], pts[i - 1], startT, t1);
+    t0 = t1;
+  }
+  // closing segment, with a one-sided tangent at the final point
+  return `${d} ${bezierTo(pts[n - 2], pts[n - 1], t0, slope2(pts[n - 2], pts[n - 1], t0))}`;
+}
+
+export function monotonePath(pts: Pt[]): string {
+  if (pts.length === 0) return '';
+  const head = `M${pts[0][0].toFixed(2)} ${pts[0][1].toFixed(2)}`;
+  return pts.length === 1 ? head : `${head} ${monotoneSegments(pts)}`;
+}
+
 // ----- layout helper: measure width before drawing -----
 
 function ChartFrame({ height, children }: { height: number; children: (w: number) => React.ReactNode }) {
@@ -110,7 +166,7 @@ export function Sparkline({
           const y = pad + innerH - ((v - min) / span) * innerH;
           return [x, y] as const;
         });
-        const line = pts.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join(' ');
+        const line = monotonePath(pts);
         const base = height - pad;
         const area = `${line} L${w.toFixed(1)} ${base} L0 ${base} Z`;
         return (
@@ -126,7 +182,7 @@ export function Sparkline({
                 <Path d={area} fill={`url(#${gradId})`} />
               </>
             )}
-            <Path d={line} stroke={color} strokeWidth={2} fill="none" strokeLinejoin="round" strokeLinecap="round" />
+            <Path d={line} stroke={color} strokeWidth={2.5} fill="none" strokeLinejoin="round" strokeLinecap="round" />
           </Svg>
         );
       }}
@@ -140,14 +196,23 @@ const AXIS_W = 40;
 const LABEL_H = 22;
 const TOP_PAD = 6;
 
-/** Round up to a "nice" axis maximum (1/2/5 × 10ⁿ). */
-function niceCeil(x: number): number {
-  if (x <= 0) return 1;
-  const exp = Math.floor(Math.log10(x));
-  const base = Math.pow(10, exp);
-  const f = x / base;
-  const nf = f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10;
-  return nf * base;
+/**
+ * A "nice" axis from 0 to just above `max`: pick a round step (1/2/2.5/5 × 10ⁿ)
+ * targeting ~5 intervals, then top = the first multiple of that step at or above
+ * `max`. Unlike a single round-up, this hugs the data (22K → 25K, not 50K) so the
+ * series fill the plot instead of cowering in the bottom quarter.
+ */
+function niceScale(max: number): { top: number; ticks: number[] } {
+  if (!(max > 0)) return { top: 1, ticks: [0, 1] };
+  const rough = max / 5;
+  const base = Math.pow(10, Math.floor(Math.log10(rough)));
+  const f = rough / base;
+  const step = (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * base;
+  const count = Math.ceil(max / step);
+  const top = count * step;
+  // index × step (not a += accumulator) so we don't drift to 0.6000000000001
+  const ticks = Array.from({ length: count + 1 }, (_, i) => i * step);
+  return { top, ticks };
 }
 
 interface XYProps {
@@ -160,7 +225,8 @@ interface XYProps {
 }
 
 export function XYChart({ kind, ...p }: XYProps & { kind: 'bar' | 'line' | 'area' }) {
-  const { data, colors, c, fmtAxis, stacked = false, height = 210 } = p;
+  const { data, colors, c, fmtAxis, stacked = false, height = 230 } = p;
+  const gradId = `xy-${useId().replace(/:/g, '')}`;
   const keys = data.seriesKeys;
   const n = data.rows.length;
 
@@ -169,7 +235,7 @@ export function XYChart({ kind, ...p }: XYProps & { kind: 'bar' | 'line' | 'area
     if (stacked) maxY = Math.max(maxY, keys.reduce((s, k) => s + (Number(row[k]) || 0), 0));
     else for (const k of keys) maxY = Math.max(maxY, Number(row[k]) || 0);
   }
-  const top = niceCeil(maxY);
+  const { top, ticks: yTicks } = niceScale(maxY);
 
   return (
     <ChartFrame height={height}>
@@ -180,8 +246,7 @@ export function XYChart({ kind, ...p }: XYProps & { kind: 'bar' | 'line' | 'area
         const yOf = (v: number) => TOP_PAD + plotH - (v / top) * plotH;
         const band = plotW / Math.max(1, n);
 
-        const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => f * top);
-        const grid = ticks.map((t, i) => {
+        const grid = yTicks.map((t, i) => {
           const y = yOf(t);
           return (
             <G key={`g${i}`}>
@@ -234,21 +299,49 @@ export function XYChart({ kind, ...p }: XYProps & { kind: 'bar' | 'line' | 'area
         } else {
           const isArea = kind === 'area';
           const xOf = (i: number) => (n === 1 ? plotX + plotW / 2 : plotX + (i + 0.5) * band);
+          // Stacked: each series sits on the running total of the ones below it, so
+          // the band's top is `lower + value` and its bottom is `lower` (which is the
+          // previous series' top — the same monotone curve, so the bands tessellate
+          // with no seams). Non-stacked: every series is an independent line from 0.
+          const lower = data.rows.map(() => 0); // running baseline per row, advanced as we stack
           marks = keys.flatMap((k, j) => {
-            const pts = data.rows.map((row, i) => [xOf(i), yOf(Number(row[k]) || 0)] as const);
-            const d = pts.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join(' ');
+            const upperPts = data.rows.map((row, i) => [xOf(i), yOf(lower[i] + (Number(row[k]) || 0))] as const);
+            const lowerPts = data.rows.map((row, i) => [xOf(i), yOf(stacked ? lower[i] : 0)] as const);
+            if (stacked) data.rows.forEach((row, i) => (lower[i] += Number(row[k]) || 0));
+
+            const lineD = monotonePath(upperPts);
             const out: React.ReactNode[] = [];
-            if (isArea && pts.length) {
-              const baseY = (TOP_PAD + plotH).toFixed(1);
-              out.push(<Path key={`a${j}`} d={`${d} L${pts[pts.length - 1][0].toFixed(1)} ${baseY} L${pts[0][0].toFixed(1)} ${baseY} Z`} fill={colors[j]} fillOpacity={0.15} />);
+            if (isArea && upperPts.length) {
+              let areaD: string;
+              if (stacked) {
+                // top edge forward, then back along the lower edge (reversed points)
+                const back = lowerPts.slice().reverse();
+                areaD = `${lineD} L${back[0][0].toFixed(1)} ${back[0][1].toFixed(1)} ${monotoneSegments(back)} Z`;
+              } else {
+                const baseY = (TOP_PAD + plotH).toFixed(1);
+                areaD = `${lineD} L${upperPts[upperPts.length - 1][0].toFixed(1)} ${baseY} L${upperPts[0][0].toFixed(1)} ${baseY} Z`;
+              }
+              out.push(<Path key={`a${j}`} d={areaD} fill={`url(#${gradId}-${j})`} />);
             }
-            out.push(<Path key={`l${j}`} d={d} stroke={colors[j]} strokeWidth={2} fill="none" strokeLinejoin="round" strokeLinecap="round" />);
+            out.push(<Path key={`l${j}`} d={lineD} stroke={colors[j]} strokeWidth={2.25} fill="none" strokeLinejoin="round" strokeLinecap="round" />);
             return out;
           });
         }
 
         return (
           <Svg width={w} height={height}>
+            {kind === 'area' && (
+              <Defs>
+                {keys.map((k, j) => (
+                  <LinearGradient key={j} id={`${gradId}-${j}`} x1="0" y1="0" x2="0" y2="1">
+                    {/* Same airy gradient the web uses, stacked or not — the line
+                        strokes on top are what delineate the bands. */}
+                    <Stop offset="5%" stopColor={colors[j]} stopOpacity={0.3} />
+                    <Stop offset="95%" stopColor={colors[j]} stopOpacity={0.02} />
+                  </LinearGradient>
+                ))}
+              </Defs>
+            )}
             {grid}
             {marks}
             {xLabels}
