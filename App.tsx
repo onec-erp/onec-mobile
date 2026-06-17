@@ -128,10 +128,12 @@ export default function App() {
   const hasBottomBar = shell?.navStyle === 'bottom_bar' && !!shell?.nav;
   const c = colors(theme);
 
-  // The server pads some content roots (e.g. the dashboard) itself; for routes
-  // that don't (lists), the host supplies the standard 16px padding.
-  const rootPadded = !!(content as any)?.card?.states?.[0]?.div?.paddings;
-  const pad = rootPadded ? 0 : 16;
+  // The server spaces some content roots itself — via paddings (dashboard,
+  // settings) or margins (menu). Only when the root has NEITHER does the host
+  // supply the standard 16px (e.g. list surfaces). Otherwise it double-pads.
+  const rootDiv = (content as any)?.card?.states?.[0]?.div;
+  const selfSpaced = !!(rootDiv?.paddings || rootDiv?.margins);
+  const pad = selfSpaced ? 0 : 16;
 
   return (
     <SafeAreaView style={[styles.screen, { backgroundColor: c.bg }]}>
