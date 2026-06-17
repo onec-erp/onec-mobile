@@ -4,12 +4,12 @@ import {
   ActivityIndicator,
   Alert,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ONEC_BASE_URL } from './src/api/config';
 import { OnecClient } from './src/api/onecClient';
 import { DivCard } from './src/divkit';
@@ -23,6 +23,7 @@ const VIEWPORT = 'mobile';
 const NAV_RESERVE = 88; // height the floating bottom bar occupies
 
 export default function App() {
+  const insets = useSafeAreaInsets();
   const client = useRef(new OnecClient(ONEC_BASE_URL)).current;
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [profile, setProfile] = useState<string | undefined>(undefined);
@@ -136,7 +137,10 @@ export default function App() {
   const pad = selfSpaced ? 0 : 16;
 
   return (
-    <SafeAreaView style={[styles.screen, { backgroundColor: c.bg }]}>
+    // Apply the top inset here (notch / status bar) so headers aren't clipped.
+    // The bottom inset is handled per-child: on the scroll padding and the nav
+    // bar, so the floating bar can sit flush against the home indicator.
+    <View style={[styles.screen, { backgroundColor: c.bg, paddingTop: insets.top }]}>
       <StatusBar style={theme === 'dark' ? 'light' : 'dark'} />
 
       <View style={{ flex: 1 }}>
@@ -154,7 +158,7 @@ export default function App() {
             </Pressable>
           </View>
         ) : content ? (
-          <ScrollView contentContainerStyle={{ paddingHorizontal: pad, paddingTop: pad, paddingBottom: pad + (hasBottomBar ? NAV_RESERVE : 0) }}>
+          <ScrollView contentContainerStyle={{ paddingHorizontal: pad, paddingTop: pad, paddingBottom: pad + insets.bottom + (hasBottomBar ? NAV_RESERVE : 0) }}>
             <DivCard
               key={route}
               envelope={content}
@@ -174,7 +178,7 @@ export default function App() {
         {hasBottomBar && (
           // The server's nav card draws its own pill (white bg, rounded border,
           // 12px margins) — we just pin it to the bottom and let it render.
-          <View style={styles.navBar} pointerEvents="box-none">
+          <View style={[styles.navBar, { paddingBottom: insets.bottom }]} pointerEvents="box-none">
             <DivCard
               envelope={shell!.nav as DivCardEnvelope}
               theme={theme}
@@ -186,7 +190,7 @@ export default function App() {
           </View>
         )}
       </View>
-    </SafeAreaView>
+    </View>
   );
 }
 
