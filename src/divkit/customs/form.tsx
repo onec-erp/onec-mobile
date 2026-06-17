@@ -9,6 +9,8 @@ import { ActivityIndicator, FlatList, Modal, Pressable, Switch, Text, TextInput,
 import type { Row } from '../../api/onecClient';
 import { colors, type ThemeColors } from '../theme';
 import type { CustomRenderer, DivHost } from '../types';
+import { GeoField } from './geo';
+import { FileField, GalleryField, ImageField } from './media';
 
 type Attr = Record<string, any>;
 const NUMERIC = new Set(['BigDecimal', 'Integer', 'Long', 'Double', 'Float', 'Short', 'int', 'long', 'double']);
@@ -275,6 +277,39 @@ function FieldControl({ attr, value, error, onChange, host }: { attr: Attr; valu
     return (
       <Field label={label} error={error}>
         <Input secureTextEntry placeholder="Leave blank to keep current" onChangeText={onChange} />
+      </Field>
+    );
+  }
+  // A field widget hint (.field(...).widget("map"|"image"|…)) wins over the type-based control.
+  // All store a plain String — coordinates for map, a stored-media reference URL for the rest.
+  const widget = ((attr.widget as string) ?? '').toLowerCase();
+  const str0 = value == null ? undefined : String(value);
+  const onStr = (v: string) => onChange(v === '' ? null : v);
+  if (/^(map|geo|geolocation)$/.test(widget)) {
+    return (
+      <Field label={label} required={required} error={error}>
+        <GeoField value={str0} onChange={onStr} theme={host.theme} />
+      </Field>
+    );
+  }
+  if (/^(images|gallery|photos)$/.test(widget)) {
+    return (
+      <Field label={label} required={required} error={error}>
+        <GalleryField value={str0} onChange={onStr} host={host} />
+      </Field>
+    );
+  }
+  if (/^(image|photo|avatar)$/.test(widget)) {
+    return (
+      <Field label={label} required={required} error={error}>
+        <ImageField value={str0} onChange={onStr} host={host} variant={widget === 'avatar' ? 'avatar' : 'image'} />
+      </Field>
+    );
+  }
+  if (/^(file|upload|attachment)$/.test(widget)) {
+    return (
+      <Field label={label} required={required} error={error}>
+        <FileField value={str0} onChange={onStr} host={host} />
       </Field>
     );
   }

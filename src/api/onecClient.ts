@@ -14,6 +14,38 @@ export interface AuthUser {
   roles: string[];
 }
 
+/** One app setting, backed by a framework `@Constant`. Booleans carry widget "switch". */
+export interface SettingMeta {
+  name: string;
+  displayName: string;
+  type: string;
+  widget: string;
+  value: unknown;
+}
+
+/** The result of a server action/page-action handler: optional toast + navigate + refresh. */
+export interface ActionResult {
+  message?: string | null;
+  navigate?: string | null;
+  refresh?: boolean;
+}
+
+/** A stored-media reference returned by `POST /api/media` (see MediaController). */
+export interface StoredMedia {
+  key?: string;
+  url: string;
+  contentType?: string;
+  size?: number;
+  filename?: string | null;
+}
+
+/** A file to upload — RN's FormData accepts this `{ uri, name, type }` shape directly. */
+export interface UploadFile {
+  uri: string;
+  name: string;
+  type: string;
+}
+
 export class OnecAuthError extends Error {}
 export class OnecRequestError extends Error {
   constructor(public path: string, public status: number) {
@@ -221,6 +253,63 @@ export class OnecClient {
   async deleteComment(commentId: string): Promise<void> {
     const res = await this.request(`/api/comments/${commentId}`, { method: 'DELETE' });
     if (!ok(res)) throw new OnecRequestError(`/api/comments/${commentId}`, res.status);
+  }
+
+  // ----- app settings (framework @Constant values, admin-only — onec-constants) -----
+
+  /** All editable app settings: `GET /api/settings`. */
+  getSettings(): Promise<SettingMeta[]> {
+    return this.json<any>('/api/settings').then((d) => (Array.isArray(d) ? (d as SettingMeta[]) : []));
+  }
+
+  /** Persist changed settings in place: `PUT /api/settings` with a `{ name: value }` map. */
+  async saveSettings(values: Row): Promise<void> {
+    const res = await this.request('/api/settings', { method: 'PUT', body: values });
+    if (!ok(res)) throw new OnecRequestError('/api/settings', res.status);
+  }
+
+  // ----- page-level action buttons (PageBuilder.actions — onec-actions) -----
+
+  /**
+   * Run a page-level action button: `POST /api/divkit/page-action?route=&key=&profile=`. The server
+   * resolves the handler by re-composing the page at `route`; the profile rides along so the same
+   * page variant resolves.
+   */
+  async runPageAction(route: string, key: string, profile?: string, inputs?: Row): Promise<ActionResult> {
+    const res = await this.request('/api/divkit/page-action', {
+      method: 'POST',
+      query: { route, key, profile },
+      body: { inputs: inputs ?? {} },
+    });
+    if (!ok(res)) throw new OnecRequestError('/api/divkit/page-action', res.status);
+    const m = (await res.json()) as any;
+    return { message: m?.message, navigate: m?.navigate, refresh: m?.refresh === true };
+  }
+
+  // ----- binary uploads (image/file field widgets — onec-form media controls) -----
+
+  /**
+   * Stream a file to the framework's binary-upload endpoint (`POST /api/media`) and resolve to its
+   * stored reference. The body is multipart/form-data — we deliberately leave Content-Type unset so
+   * fetch writes the multipart boundary itself; the CSRF header rides along (a mutating request).
+   * Callers persist the returned `url` rather than base64-ing bytes through a field.
+   */
+  async uploadMedia(file: UploadFile): Promise<StoredMedia> {
+    if (!this.csrf) await this.me(); // seed the session + CSRF cookie before the mutating POST
+    const form = new FormData();
+    // RN's FormData takes a `{ uri, name, type }` part; the cast satisfies the DOM lib types.
+    form.append('file', { uri: file.uri, name: file.name, type: file.type } as any);
+    const headers: Record<string, string> = {};
+    if (this.csrf) headers['X-XSRF-TOKEN'] = this.csrf;
+    const res = await fetch(this.baseUrl.replace(/\/$/, '') + '/api/media', {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: form,
+    });
+    this.captureCsrf(res);
+    if (!ok(res)) throw new OnecRequestError('/api/media', res.status);
+    return (await res.json()) as StoredMedia;
   }
 }
 
