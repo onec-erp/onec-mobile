@@ -106,14 +106,133 @@ export class OnecClient {
     });
   }
 
-  /** Chrome card set: `{ navStyle, nav, account }`. */
-  shell(o: { viewport?: string; theme?: string; profile?: string } = {}): Promise<unknown> {
+  /** Chrome card set: `{ navStyle, home, nav, account }`. */
+  shell(o: { viewport?: string; theme?: string; profile?: string } = {}): Promise<{
+    navStyle?: string;
+    home?: string;
+    nav?: { templates?: Record<string, unknown>; card: unknown };
+    account?: { templates?: Record<string, unknown>; card: unknown };
+  }> {
     return this.json('/api/divkit/shell', {
       viewport: o.viewport ?? 'mobile',
       theme: o.theme ?? 'light',
       profile: o.profile,
     });
   }
+
+  // ----- generic entity REST (used by the custom widgets) -----
+
+  /** Paged list rows: `GET /api/list/{kind}/{name}` → `{ total, offset, rows }`. */
+  async listRows(
+    kind: string,
+    name: string,
+    o: { q?: string; limit?: number; offset?: number; sort?: string; descending?: boolean } = {},
+  ): Promise<{ total: number; offset: number; rows: Row[] }> {
+    const data = await this.json<any>(`/api/list/${kind}/${name}`, {
+      limit: String(o.limit ?? 100),
+      offset: String(o.offset ?? 0),
+      q: o.q || undefined,
+      sort: o.sort || undefined,
+      dir: o.sort ? (o.descending ? 'desc' : 'asc') : undefined,
+    });
+    return {
+      total: Number(data?.total ?? 0),
+      offset: Number(data?.offset ?? o.offset ?? 0),
+      rows: asRows(data?.rows),
+    };
+  }
+
+  /** Full row set: `GET /api/{kind}/{name}` (or a register's movements/turnover). */
+  async rows(
+    kind: string,
+    name: string,
+    o: { from?: string; to?: string; registerPath?: string } = {},
+  ): Promise<Row[]> {
+    const path = o.registerPath ? `/api/registers/${name}/${o.registerPath}` : `/api/${kind}/${name}`;
+    const res = await this.request(path, { query: { from: o.from, to: o.to } });
+    if (res.status !== 200) throw new OnecRequestError(path, res.status);
+    return asRows(await res.json());
+  }
+
+  /** Typeahead for a ref picker: `GET /api/{kind}/{name}?q=&limit=`. */
+  typeahead(kind: string, name: string, q: string, limit = 30): Promise<Row[]> {
+    return this.json<any>(`/api/${kind}/${name}`, { q, limit: String(limit) }).then(asRows);
+  }
+
+  async createEntity(kind: string, name: string, body: Row): Promise<Row> {
+    const res = await this.request(`/api/${kind}/${name}`, { method: 'POST', body });
+    if (!ok(res)) throw new OnecRequestError(`/api/${kind}/${name}`, res.status);
+    return (await res.json()) as Row;
+  }
+
+  async updateEntity(kind: string, name: string, id: string, body: Row): Promise<Row> {
+    const res = await this.request(`/api/${kind}/${name}/${id}`, { method: 'PUT', body });
+    if (!ok(res)) throw new OnecRequestError(`/api/${kind}/${name}/${id}`, res.status);
+    return (await res.json()) as Row;
+  }
+
+  async deleteEntity(kind: string, name: string, id: string): Promise<void> {
+    const res = await this.request(`/api/${kind}/${name}/${id}`, { method: 'DELETE' });
+    if (!ok(res)) throw new OnecRequestError(`/api/${kind}/${name}/${id}`, res.status);
+  }
+
+  async postDocument(name: string, id: string): Promise<void> {
+    const res = await this.request(`/api/documents/${name}/${id}/post`, { method: 'POST' });
+    if (!ok(res)) throw new OnecRequestError(`/api/documents/${name}/${id}/post`, res.status);
+  }
+
+  async unpostDocument(name: string, id: string): Promise<void> {
+    const res = await this.request(`/api/documents/${name}/${id}/unpost`, { method: 'POST' });
+    if (!ok(res)) throw new OnecRequestError(`/api/documents/${name}/${id}/unpost`, res.status);
+  }
+
+  /** Run a custom list/detail action: `POST /api/actions/{kind}/{name}/{key}[?id=]`. */
+  async runAction(
+    kind: string,
+    name: string,
+    key: string,
+    o: { id?: string; inputs?: Row } = {},
+  ): Promise<{ message?: string; navigate?: string; refresh?: boolean }> {
+    const res = await this.request(`/api/actions/${kind}/${name}/${key}`, {
+      method: 'POST',
+      query: { id: o.id },
+      body: { inputs: o.inputs },
+    });
+    if (!ok(res)) throw new OnecRequestError(`/api/actions/${kind}/${name}/${key}`, res.status);
+    const m = (await res.json()) as any;
+    return { message: m?.message, navigate: m?.navigate, refresh: m?.refresh === true };
+  }
+
+  // ----- comments -----
+
+  comments(kind: string, name: string, id: string): Promise<Row[]> {
+    return this.json<any>(`/api/comments/${kind}/${name}/${id}`).then(asRows);
+  }
+
+  async addComment(kind: string, name: string, id: string, body: string): Promise<Row> {
+    const res = await this.request(`/api/comments/${kind}/${name}/${id}`, {
+      method: 'POST',
+      body: { body },
+    });
+    if (!ok(res)) throw new OnecRequestError(`/api/comments/${kind}/${name}/${id}`, res.status);
+    return (await res.json()) as Row;
+  }
+
+  async deleteComment(commentId: string): Promise<void> {
+    const res = await this.request(`/api/comments/${commentId}`, { method: 'DELETE' });
+    if (!ok(res)) throw new OnecRequestError(`/api/comments/${commentId}`, res.status);
+  }
+}
+
+export type Row = Record<string, any>;
+
+function ok(res: Response): boolean {
+  return res.status >= 200 && res.status < 300;
+}
+
+function asRows(data: unknown): Row[] {
+  if (Array.isArray(data)) return data.filter((x) => x && typeof x === 'object') as Row[];
+  return [];
 }
 
 function queryString(q?: Record<string, string | undefined>): string {

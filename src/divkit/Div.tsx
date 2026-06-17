@@ -15,8 +15,12 @@ interface Ctx {
   host: DivHost;
 }
 
-export function Div({ block, ctx }: { block: DivBlock; ctx: Ctx }): React.ReactElement | null {
-  if (!block || typeof block !== 'object') return null;
+export function Div({ block: rawBlock, ctx }: { block: DivBlock; ctx: Ctx }): React.ReactElement | null {
+  if (!rawBlock || typeof rawBlock !== 'object') return null;
+  // Resolve @{…} expressions in this node's own props (colors, text, sizes,
+  // action urls) against the current variables. Children resolve themselves, and
+  // custom_props are left to the custom renderer.
+  const block = resolveProps(rawBlock, ctx.vars) as DivBlock;
   if (block.visibility === 'gone') return null;
   const invisible = block.visibility === 'invisible';
   const baseStyle = [boxStyle(block), invisible ? { opacity: 0 } : null];
@@ -139,6 +143,21 @@ function wrapActions(
       {node}
     </Pressable>
   );
+}
+
+// Shallow-deep resolve of a node's own expression-bearing props. Skips `items`
+// (children render + resolve themselves) and `custom_props` (owned by the custom).
+function resolveProps(node: unknown, vars: Variables): unknown {
+  if (typeof node === 'string') return resolve(node, vars);
+  if (Array.isArray(node)) return node.map((n) => resolveProps(n, vars));
+  if (node && typeof node === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(node)) {
+      out[k] = k === 'items' || k === 'custom_props' || k === 'states' ? v : resolveProps(v, vars);
+    }
+    return out;
+  }
+  return node;
 }
 
 function absolutize(url: string, baseUrl?: string): string {

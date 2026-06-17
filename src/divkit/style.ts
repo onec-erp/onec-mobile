@@ -62,6 +62,7 @@ export function containerStyle(b: DivBlock): ViewStyle {
   const style: ViewStyle = {
     flexDirection: horizontal ? 'row' : 'column',
   };
+  if (typeof b.item_spacing === 'number') style.gap = b.item_spacing;
   // In RN, alignItems is the cross axis, justifyContent the main axis.
   const ch = b.content_alignment_horizontal;
   const cv = b.content_alignment_vertical;

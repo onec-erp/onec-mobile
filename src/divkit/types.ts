@@ -104,6 +104,10 @@ export interface DivHost {
   /** Read/patch card variables. */
   getVar: (name: string) => unknown;
   setVar: (name: string, value: unknown) => void;
+  /** Reload the current surface after a write (post/save/delete). */
+  refresh: () => void;
+  /** The API client, for data-driven customs (list/widget/form/comments). */
+  client: import('../api/onecClient').OnecClient;
   /** Origin used to absolutize relative image urls. */
   baseUrl?: string;
   theme: 'light' | 'dark';

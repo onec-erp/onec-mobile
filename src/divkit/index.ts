@@ -1,3 +1,5 @@
+import './customs'; // side-effect: register all onec-* renderers
+
 export { DivCard } from './DivCard';
 export type { DivCardProps } from './DivCard';
 export { Div } from './Div';

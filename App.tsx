@@ -2,6 +2,7 @@ import { StatusBar } from 'expo-status-bar';
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -15,24 +16,36 @@ import { DivCard } from './src/divkit';
 import type { DivCardEnvelope } from './src/divkit';
 
 type Status = 'connecting' | 'ready' | 'error';
+type Shell = Awaited<ReturnType<OnecClient['shell']>>;
+
+const VIEWPORT = 'mobile';
+const NAV_RESERVE = 88; // height the floating bottom bar occupies
 
 export default function App() {
   const client = useRef(new OnecClient(ONEC_BASE_URL)).current;
+  const [theme, setTheme] = useState<'light' | 'dark'>('light');
+  const [profile, setProfile] = useState<string | undefined>(undefined);
+  const [shell, setShell] = useState<Shell | null>(null);
+  const [route, setRoute] = useState('/');
+  const [content, setContent] = useState<DivCardEnvelope | null>(null);
   const [status, setStatus] = useState<Status>('connecting');
-  const [error, setError] = useState<string>('');
-  const [user, setUser] = useState<string>('');
-  const [route, setRoute] = useState<string>('/');
-  const [envelope, setEnvelope] = useState<DivCardEnvelope | null>(null);
-  const [log, setLog] = useState<string[]>([]);
+  const [error, setError] = useState('');
 
-  // Load a content route from the server, replacing the current card.
-  async function load(path: string) {
+  async function loadShell() {
+    try {
+      setShell(await client.shell({ viewport: VIEWPORT, theme, profile }));
+    } catch {
+      /* nav is non-fatal; content still shows */
+    }
+  }
+
+  async function loadContent(path: string) {
     setStatus('connecting');
     setError('');
+    setRoute(path);
     try {
-      const env = (await client.content(path)) as DivCardEnvelope;
-      setRoute(path);
-      setEnvelope(env);
+      const env = (await client.content(path, { viewport: VIEWPORT, theme, profile })) as DivCardEnvelope;
+      setContent(env);
       setStatus('ready');
     } catch (e: any) {
       setError(String(e?.message ?? e));
@@ -40,114 +53,142 @@ export default function App() {
     }
   }
 
-  // Connect once: ensure logged in (admin/admin), then load home.
-  useEffect(() => {
-    (async () => {
-      try {
-        let me = await client.me();
-        if (!me.authenticated) me = await client.login('admin', 'admin');
-        setUser(me.username);
-        await load('/');
-      } catch (e: any) {
-        setError(String(e?.message ?? e));
-        setStatus('error');
-      }
-    })();
-  }, []);
-
-  // An onec:// action: log it, and navigate if it looks like a content route.
-  function fire(url: string) {
-    setLog((l) => [url, ...l].slice(0, 6));
-    if (url.startsWith('onec://')) {
-      const rest = url.slice('onec://'.length).replace(/\?.*$/, '');
-      if (rest && !rest.includes('://')) load('/' + rest);
+  async function connect() {
+    setStatus('connecting');
+    try {
+      let me = await client.me();
+      if (!me.authenticated) me = await client.login('admin', 'admin');
+      await Promise.all([loadShell(), loadContent('/')]);
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+      setStatus('error');
     }
   }
 
+  useEffect(() => {
+    connect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ----- onec:// action routing (mirrors the Flutter HomeShell) -----
+  function onAction(url: string) {
+    if (!url.startsWith('onec://')) return;
+    const rest = url.slice('onec://'.length);
+
+    if (rest === 'logout') {
+      client.logout().finally(connect);
+      return;
+    }
+    if (rest === 'theme/toggle') {
+      const next = theme === 'light' ? 'dark' : 'light';
+      setTheme(next);
+      // reload with the new theme
+      setTimeout(() => {
+        loadShell();
+        loadContent(route);
+      }, 0);
+      return;
+    }
+    if (rest.startsWith('app')) {
+      const q = rest.indexOf('?');
+      const params = new URLSearchParams(q >= 0 ? rest.slice(q + 1) : '');
+      setProfile(params.get('profile') ?? undefined);
+      setTimeout(() => {
+        loadShell();
+        loadContent('/');
+      }, 0);
+      return;
+    }
+    if (rest.startsWith('delete/')) {
+      const p = rest.split('/'); // delete/{kind}/{name}/{id}
+      if (p.length >= 4) confirmDelete(p[1], p[2], p[3]);
+      return;
+    }
+    loadContent(('/' + rest).replace('//', '/'));
+  }
+
+  function confirmDelete(kind: string, name: string, id: string) {
+    Alert.alert('Delete record?', 'This marks the record for deletion.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await client.deleteEntity(kind, name, id);
+            loadContent(`/${kind}/${name}`);
+          } catch (e: any) {
+            Alert.alert('Delete failed', String(e?.message ?? e));
+          }
+        },
+      },
+    ]);
+  }
+
+  const navVars = { active_path: route };
+  const hasBottomBar = shell?.navStyle === 'bottom_bar' && !!shell?.nav;
+
   return (
     <SafeAreaView style={styles.screen}>
-      <StatusBar style="dark" />
+      <StatusBar style={theme === 'dark' ? 'light' : 'dark'} />
 
-      <View style={styles.header}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.title}>OneC · React Native</Text>
-          <Text style={styles.sub}>
-            {ONEC_BASE_URL.replace(/^https?:\/\//, '')}
-            {user ? `  ·  ${user}` : ''}
-            {`  ·  ${route}`}
-          </Text>
-        </View>
-        {route !== '/' && (
-          <Pressable style={styles.btn} onPress={() => load('/')}>
-            <Text style={styles.btnText}>Home</Text>
-          </Pressable>
-        )}
-      </View>
-
-      <ScrollView contentContainerStyle={styles.scroll}>
-        {status === 'connecting' && (
+      <View style={{ flex: 1 }}>
+        {status === 'connecting' && !content ? (
           <View style={styles.center}>
             <ActivityIndicator />
-            <Text style={styles.muted}>Loading {route} from the server…</Text>
+            <Text style={styles.muted}>Connecting to {ONEC_BASE_URL.replace(/^https?:\/\//, '')}…</Text>
           </View>
-        )}
-
-        {status === 'error' && (
+        ) : status === 'error' ? (
           <View style={styles.center}>
             <Text style={styles.errTitle}>Couldn’t reach the server</Text>
             <Text style={styles.muted}>{error}</Text>
-            <Text style={styles.muted}>Base URL: {ONEC_BASE_URL}</Text>
-            <Pressable style={styles.btn} onPress={() => load(route)}>
+            <Pressable style={styles.btn} onPress={() => loadContent(route)}>
               <Text style={styles.btnText}>Retry</Text>
             </Pressable>
           </View>
-        )}
+        ) : content ? (
+          <ScrollView contentContainerStyle={{ paddingBottom: hasBottomBar ? NAV_RESERVE : 0 }}>
+            <DivCard
+              key={route}
+              envelope={content}
+              theme={theme}
+              client={client}
+              baseUrl={ONEC_BASE_URL}
+              fire={onAction}
+              refresh={() => loadContent(route)}
+              vars={{ ...((content as any).vars ?? {}), ...navVars }}
+            />
+            {status === 'connecting' && (
+              <View style={{ paddingVertical: 16 }}><ActivityIndicator /></View>
+            )}
+          </ScrollView>
+        ) : null}
 
-        {status === 'ready' && envelope && (
-          <View style={styles.card}>
-            <DivCard envelope={envelope} theme="light" fire={fire} baseUrl={ONEC_BASE_URL} />
+        {hasBottomBar && (
+          // The server's nav card draws its own pill (white bg, rounded border,
+          // 12px margins) — we just pin it to the bottom and let it render.
+          <View style={styles.navBar} pointerEvents="box-none">
+            <DivCard
+              envelope={shell!.nav as DivCardEnvelope}
+              theme={theme}
+              client={client}
+              baseUrl={ONEC_BASE_URL}
+              fire={onAction}
+              vars={navVars}
+            />
           </View>
         )}
-
-        <Text style={styles.kicker}>Dispatched actions</Text>
-        <View style={styles.console}>
-          {log.length === 0 ? (
-            <Text style={styles.consoleMuted}>Tap something to fire its onec:// action…</Text>
-          ) : (
-            log.map((u, i) => (
-              <Text key={i} style={styles.logLine}>
-                → {u}
-              </Text>
-            ))
-          )}
-        </View>
-      </ScrollView>
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: '#F3F4F6' },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#E5E7EB',
-    backgroundColor: '#FFFFFF',
-  },
-  title: { fontSize: 16, fontWeight: '700', color: '#0A0A0A' },
-  sub: { fontSize: 12, color: '#737373', marginTop: 2 },
-  btn: { backgroundColor: '#111827', paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8 },
-  btnText: { color: '#FFFFFF', fontWeight: '600', fontSize: 13 },
-  scroll: { padding: 16, gap: 12 },
-  center: { alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 48 },
-  errTitle: { fontSize: 15, fontWeight: '700', color: '#B91C1C' },
-  kicker: { fontSize: 12, fontWeight: '600', color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: 0.5 },
-  card: { backgroundColor: '#FFFFFF', borderRadius: 12, borderWidth: 1, borderColor: '#E5E7EB', overflow: 'hidden' },
+  screen: { flex: 1, backgroundColor: '#FFFFFF' },
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 10, padding: 24 },
   muted: { color: '#6B7280', fontSize: 13, textAlign: 'center' },
-  console: { backgroundColor: '#111827', borderRadius: 10, padding: 12, minHeight: 60, gap: 4 },
-  consoleMuted: { color: '#6B7280', fontSize: 13 },
-  logLine: { color: '#34D399', fontFamily: 'Courier', fontSize: 13 },
+  errTitle: { fontSize: 15, fontWeight: '700', color: '#B91C1C' },
+  btn: { backgroundColor: '#111827', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8 },
+  btnText: { color: '#FFFFFF', fontWeight: '600', fontSize: 13 },
+  navBar: { position: 'absolute', left: 0, right: 0, bottom: 0 },
 });
