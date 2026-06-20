@@ -30,24 +30,23 @@ public class OnnoTelegramLoginModule: Module {
     Name("OnnoTelegramLogin")
 
     AsyncFunction("login") { (options: [String: Any?], promise: Promise) in
-      let nonce = options["nonce"] as? String
       DispatchQueue.main.async {
-        OnnoTelegramLoginModule.startLogin(nonce: nonce, promise: promise)
+        OnnoTelegramLoginModule.startLogin(options: options, promise: promise)
       }
     }
   }
 
-  static func startLogin(nonce: String?, promise: Promise) {
+  static func startLogin(options: [String: Any?], promise: Promise) {
     #if canImport(TelegramLogin)
-    guard let cfg = TelegramLoginConfig.fromInfoPlist() else {
-      promise.reject("ERR_TELEGRAM_UNAVAILABLE", "Telegram login is not configured. Add the plugin options in app.json (appId/clientId).")
+    // Per-login overrides (which bot/ERP) take precedence over the build-time default, so one app can
+    // sign in against many servers. `nonce` is reserved for replay protection; the current SDK doesn't
+    // take one, so it's bound by the server rather than threaded through the SDK here.
+    guard let cfg = TelegramLoginConfig.resolve(options: options) else {
+      promise.reject("ERR_TELEGRAM_UNAVAILABLE", "Telegram login is not configured (no clientId from the server or app.json).")
       return
     }
-    // `nonce` is reserved for replay protection; the current SDK doesn't take one, so it's bound by
-    // the server (/api/auth/telegram/native/begin) rather than threaded through the SDK here.
-    _ = nonce
 
-    TelegramLoginConfig.ensureConfigured(cfg)
+    TelegramLoginConfig.configure(cfg)
 
     TelegramLogin.login { result in
       switch result {
@@ -63,7 +62,7 @@ public class OnnoTelegramLoginModule: Module {
       }
     }
     #else
-    _ = nonce
+    _ = options
     promise.reject(
       "ERR_TELEGRAM_UNAVAILABLE",
       "Telegram login SDK is not linked in this build. Add it via Swift Package Manager — see modules/onno-telegram-login/README.md."
@@ -73,37 +72,59 @@ public class OnnoTelegramLoginModule: Module {
 }
 
 #if canImport(TelegramLogin)
-/// Reads the Info.plist values the config plugin writes, and configures the SDK once.
+/// Resolves the bot config — per-login overrides from JS first, then the build-time Info.plist
+/// defaults — and (re)configures the SDK for that bot.
 struct TelegramLoginConfig {
   let clientId: String
   let redirectUri: String
   let scopes: [String]
 
-  private static var configured = false
+  private static var lastConfigured: String?
 
-  static func fromInfoPlist() -> TelegramLoginConfig? {
+  /// Default redirect when neither JS nor Info.plist provides one: the custom scheme works for any bot.
+  private static var defaultRedirectUri: String {
     let info = Bundle.main.infoDictionary
-    guard
-      let clientId = info?["TelegramLoginClientId"] as? String, !clientId.isEmpty,
-      let redirectUri = info?["TelegramLoginRedirectUri"] as? String, !redirectUri.isEmpty
-    else {
-      return nil
-    }
-    let scopes = (info?["TelegramLoginScopes"] as? [String]) ?? ["profile"]
+    if let r = info?["TelegramLoginRedirectUri"] as? String, !r.isEmpty { return r }
+    if let s = info?["TelegramLoginCustomScheme"] as? String, !s.isEmpty { return "\(s)://tglogin" }
+    return ""
+  }
+
+  static func resolve(options: [String: Any?]) -> TelegramLoginConfig? {
+    let info = Bundle.main.infoDictionary
+    let clientId = (options["clientId"] as? String)?.nonEmpty
+      ?? (info?["TelegramLoginClientId"] as? String)?.nonEmpty
+    guard let clientId else { return nil }
+
+    let redirectUri = (options["redirectUri"] as? String)?.nonEmpty ?? defaultRedirectUri
+    guard !redirectUri.isEmpty else { return nil }
+
+    let scopes = (options["scopes"] as? [String])?.nonEmpty
+      ?? (info?["TelegramLoginScopes"] as? [String])
+      ?? ["profile"]
     return TelegramLoginConfig(clientId: clientId, redirectUri: redirectUri, scopes: scopes)
   }
 
-  static func ensureConfigured(_ cfg: TelegramLoginConfig) {
-    guard !configured else { return }
+  static func configure(_ cfg: TelegramLoginConfig) {
+    // Reconfigure only when the bot actually changes (cheap idempotence across repeat logins).
+    let key = "\(cfg.clientId)|\(cfg.redirectUri)|\(cfg.scopes.joined(separator: ","))"
+    guard key != lastConfigured else { return }
     TelegramLogin.configure(clientId: cfg.clientId, redirectUri: cfg.redirectUri, scopes: cfg.scopes)
-    configured = true
+    lastConfigured = key
   }
 
-  /// Configure from Info.plist if possible (used at app launch by the AppDelegate subscriber).
+  /// Configure from Info.plist if a default bot is set (used at app launch by the AppDelegate subscriber).
   static func configureFromInfoPlistIfPossible() {
-    if let cfg = fromInfoPlist() {
-      ensureConfigured(cfg)
+    if let cfg = resolve(options: [:]) {
+      configure(cfg)
     }
   }
+}
+
+private extension String {
+  var nonEmpty: String? { isEmpty ? nil : self }
+}
+
+private extension Array where Element == String {
+  var nonEmpty: [String]? { isEmpty ? nil : self }
 }
 #endif

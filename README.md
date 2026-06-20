@@ -43,13 +43,32 @@ hardcoded button.
 
 Tap sequence when `id === "telegram"` on a native build with the module linked:
 
-1. `POST /api/auth/telegram/native/begin` → `{ nonce }` (optional; replay protection).
-2. `telegramLogin({ nonce })` — runs the SDK. It opens the **Telegram app** when installed, otherwise
-   falls back to **ASWebAuthenticationSession** (iOS) / **Custom Tab** (Android). Resolves to an OIDC
-   **ID token** (JWT).
+1. `POST /api/auth/telegram/native/begin` → `{ nonce }` plus, optionally, **this server's bot**
+   (`clientId` / `redirectUri` / `scopes`). Replay protection + multi-tenant bot selection.
+2. `telegramLogin({ nonce, clientId, redirectUri, scopes })` — runs the SDK for that bot. It opens the
+   **Telegram app** when installed, otherwise falls back to **ASWebAuthenticationSession** (iOS) /
+   **Custom Tab** (Android). Resolves to an OIDC **ID token** (JWT).
 3. `POST /api/auth/telegram/native` with `{ idToken }` through the **same `OnnoClient`** — on `200`
    the server's `Set-Cookie` session lands in the shared cookie jar, so it persists across relaunch
    and authenticates every later `/api/**` request. The app then refreshes auth state and enters.
+
+#### Multiple bots / multiple ERPs
+
+This app connects to many servers, each with **its own Telegram bot** — so the bot is chosen at
+**runtime**, not baked in. `/native/begin` returns the active server's `clientId` / `redirectUri` /
+`scopes`, which are passed straight to the SDK (falling back to a build-time default bot if the server
+sends none). The one native constraint: a redirect can only return to this binary if its mechanism was
+registered **at build time**:
+
+- **Custom scheme** (`onno-telegram://tglogin`) — registered once, **not** domain-bound, so it works
+  for **any** bot registered to this app's bundle id/package in @BotFather. This is the default
+  runtime `redirectUri` and the multi-tenant baseline.
+- **Universal Links / App Links** (`app{appId}-login.tg.dev`) — nicer UX/security, but each domain
+  must be listed in `universalLinkAppIds` at build time, so only for the finite set of bots you know up
+  front. (The bridges match **any** `…-login.tg.dev` callback, so listing more is the only step.)
+
+So: an unbounded set of ERPs works out of the box via the custom scheme; opt specific bots into
+Universal Links by adding their `appId`s and rebuilding.
 
 Each outcome is surfaced distinctly:
 
@@ -65,10 +84,10 @@ Each outcome is surfaced distinctly:
 
 ### Setup
 
-#### 1. Register the app with @BotFather
+#### 1. Register each bot with @BotFather
 
-Use the **same bot** as the web flow. In Telegram: **@BotFather → your bot → Bot Settings → Login
-Widget**, and register the native apps:
+For **every** bot/ERP, in Telegram **@BotFather → your bot → Bot Settings → Login Widget**, register
+this app — the **same bundle id/package** for all of them:
 
 - **iOS** — Bundle ID `su.onno.onnomobile` + your Apple **Team ID**.
 - **Android** — package `su.onno.onnomobile` + the **SHA-256** signing-certificate fingerprint
@@ -78,28 +97,36 @@ Widget**, and register the native apps:
   keytool -list -v -keystore <your.keystore> -alias <alias> | grep SHA256
   ```
 
-Telegram then gives you an **app id** and a **client id**. The app id forms the hosted redirect domain
-`app{appId}-login.tg.dev` (no AASA/asset-links hosting needed on your side — Telegram hosts it). No
-secrets live in the app; the bot token and signing secrets stay with @BotFather and the server.
+Each bot yields a **client id** (and an **app id** → the hosted domain `app{appId}-login.tg.dev`, which
+Telegram hosts — no AASA/asset-links hosting on your side). Have each **server return its bot's
+`clientId`** (and optionally `redirectUri`/`scopes`) from `/api/auth/telegram/native/begin`; default
+`redirectUri` is the app's custom scheme. No secrets live in the app.
 
 #### 2. Configure the plugin
 
-Set the ids in `app.json` (leave empty to keep the web flow):
+`app.json` only needs build-time redirect registration — **not** per-bot ids (those come from the
+server at runtime):
 
 ```json
 ["./plugins/withTelegramLogin", {
-  "appId": "123456",
-  "clientId": "YOUR_BOT_CLIENT_ID",
-  "scopes": ["profile"],
-  "iosCustomScheme": "onno-telegram"
+  "iosCustomScheme": "onno-telegram",
+  "universalLinkAppIds": [],
+  "defaultClientId": "",
+  "defaultAppId": "",
+  "scopes": ["profile"]
 }]
 ```
 
-The plugin writes the SDK config (client id, `https://app{appId}-login.tg.dev` redirect, scopes) into
-Info.plist / manifest `<meta-data>`, adds the iOS Associated Domain + Android verified app-link
-intent-filter for the callback, and allow-lists `tg` in `LSApplicationQueriesSchemes`. The native
-bridges read that config and drive the SDK — the callback is delivered automatically (iOS AppDelegate
-subscriber → `TelegramLogin.handle`, Android `OnNewIntent` → `handleLoginResponse`).
+- `iosCustomScheme` — registered as the any-bot redirect (CFBundleURLTypes / Android intent-filter)
+  and the default runtime `redirectUri`. Always on.
+- `universalLinkAppIds` — opt specific bots into Universal Links / verified App Links (adds the iOS
+  Associated Domain + Android `autoVerify` app-link intent-filter per `appId`).
+- `defaultClientId` / `defaultAppId` — optional single-tenant fallback baked into Info.plist /
+  `<meta-data>` for when a server sends no per-bot config.
+
+The native bridges read this config and the runtime overrides, drive the SDK, and the callback is
+delivered automatically (iOS AppDelegate subscriber → `TelegramLogin.handle`; Android `OnNewIntent` →
+`handleLoginResponse`), matching **any** `…-login.tg.dev` domain or the custom scheme.
 
 #### 3. Add the SDK to each platform
 

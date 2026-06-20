@@ -4,14 +4,16 @@ import type { TelegramNativeUser } from '../../api/onnoClient';
 const USER: TelegramNativeUser = { id: '42', username: 'durov', name: 'Pavel' };
 
 /** A fake client that records the call order so we can assert the begin→login sequence. */
-function makeClient(over: Partial<TelegramFlowClient> & { nonce?: string | null } = {}) {
+function makeClient(
+  over: Partial<TelegramFlowClient> & { nonce?: string | null; bot?: { clientId?: string; redirectUri?: string; scopes?: string[] } } = {},
+) {
   const calls: string[] = [];
   const client: TelegramFlowClient = {
     telegramNativeBegin: over.telegramNativeBegin
       ? over.telegramNativeBegin
       : jest.fn(async () => {
           calls.push('begin');
-          return { nonce: over.nonce ?? 'nonce-123' };
+          return { nonce: over.nonce ?? 'nonce-123', ...(over.bot ?? {}) };
         }),
     telegramNativeLogin: over.telegramNativeLogin
       ? over.telegramNativeLogin
@@ -34,9 +36,19 @@ describe('runTelegramNativeLogin — the begin → SDK → login sequence', () =
     const result = await runTelegramNativeLogin({ client, telegramLogin });
 
     expect(calls).toEqual(['begin', 'sdk:nonce-123', 'login:jwt-abc']);
-    expect(telegramLogin).toHaveBeenCalledWith({ nonce: 'nonce-123' });
+    expect(telegramLogin).toHaveBeenCalledWith({ nonce: 'nonce-123', clientId: undefined, redirectUri: undefined, scopes: undefined });
     expect(client.telegramNativeLogin).toHaveBeenCalledWith('jwt-abc');
     expect(result).toEqual({ user: USER, viaWebFallback: false });
+  });
+
+  it('threads THIS server\'s bot config (clientId/redirectUri/scopes) from begin into the SDK — multi-tenant', async () => {
+    const bot = { clientId: 'bot-erp-2', redirectUri: 'onno-telegram://tglogin', scopes: ['profile', 'phone'] };
+    const { client } = makeClient({ nonce: 'n9', bot });
+    const telegramLogin: TelegramLoginFn = jest.fn(async () => ({ idToken: 'jwt', viaWebFallback: false }));
+
+    await runTelegramNativeLogin({ client, telegramLogin });
+
+    expect(telegramLogin).toHaveBeenCalledWith({ nonce: 'n9', ...bot });
   });
 
   it('still completes the login when /native/begin fails (nonce is optional)', async () => {

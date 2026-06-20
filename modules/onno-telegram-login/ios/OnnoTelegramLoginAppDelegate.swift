@@ -51,14 +51,13 @@ public class OnnoTelegramLoginAppDelegate: ExpoAppDelegateSubscriber {
     return Self.handleIfTelegram(url)
   }
 
-  /// Forward the URL to the SDK only when it's our Telegram redirect; returns whether we claimed it.
+  /// Forward the URL to the SDK only when it's a Telegram redirect; returns whether we claimed it.
+  /// Matches ANY `…-login.tg.dev` Universal Link (so multiple bots/ERPs work) or our custom scheme.
   private static func handleIfTelegram(_ url: URL) -> Bool {
     #if canImport(TelegramLogin)
-    let info = Bundle.main.infoDictionary
-    let redirectHost = (info?["TelegramLoginRedirectUri"] as? String).flatMap { URL(string: $0)?.host }
-    let customScheme = info?["TelegramLoginCustomScheme"] as? String
+    let customScheme = Bundle.main.infoDictionary?["TelegramLoginCustomScheme"] as? String
 
-    let matchesUniversal = url.host != nil && url.host == redirectHost
+    let matchesUniversal = (url.host?.hasSuffix("-login.tg.dev")) ?? false
     let matchesScheme = customScheme != nil && url.scheme?.lowercased() == customScheme?.lowercased()
     guard matchesUniversal || matchesScheme else {
       return false

@@ -35,15 +35,16 @@ import expo.modules.kotlin.Promise
 
 class OnnoTelegramLoginModule : Module() {
   private var pending: Promise? = null
-  private var redirectHost: String? = null
+  private var customScheme: String? = null
 
   override fun definition() = ModuleDefinition {
     Name("OnnoTelegramLogin")
 
-    AsyncFunction("login") { _: Map<String, Any?>, promise: Promise ->
-      // The `nonce` option is reserved for replay protection; the current SDK doesn't take one, so
-      // it's bound by the server (/api/auth/telegram/native/begin) rather than threaded through here.
-      startLogin(promise)
+    AsyncFunction("login") { options: Map<String, Any?>, promise: Promise ->
+      // Per-login overrides (which bot/ERP) take precedence over the build-time default, so one app
+      // can sign in against many servers. The `nonce` option is reserved for replay protection; the
+      // current SDK doesn't take one, so it's bound by the server rather than threaded through here.
+      startLogin(options, promise)
     }
 
     OnNewIntent { intent ->
@@ -52,7 +53,7 @@ class OnnoTelegramLoginModule : Module() {
     }
   }
 
-  private fun startLogin(promise: Promise) {
+  private fun startLogin(options: Map<String, Any?>, promise: Promise) {
     if (!TelegramLoginSdk.isAvailable) {
       promise.reject(
         "ERR_TELEGRAM_UNAVAILABLE",
@@ -68,11 +69,11 @@ class OnnoTelegramLoginModule : Module() {
       return
     }
 
-    val cfg = TelegramLoginConfig.fromManifest(context)
+    val cfg = TelegramLoginConfig.resolve(context, options)
     if (cfg == null) {
       promise.reject(
         "ERR_TELEGRAM_UNAVAILABLE",
-        "Telegram login is not configured. Add the plugin options in app.json (appId/clientId).",
+        "Telegram login is not configured (no clientId from the server or app.json).",
         null,
       )
       return
@@ -81,7 +82,7 @@ class OnnoTelegramLoginModule : Module() {
     // A previous attempt that never received its redirect is superseded.
     pending?.reject("ERR_TELEGRAM_CANCELLED", "Superseded by a new Telegram sign-in.", null)
     pending = promise
-    redirectHost = Uri.parse(cfg.redirectUri).host
+    customScheme = Uri.parse(cfg.redirectUri).scheme
 
     try {
       TelegramLoginSdk.init(cfg.clientId, cfg.redirectUri, cfg.scopes)
@@ -93,8 +94,9 @@ class OnnoTelegramLoginModule : Module() {
   }
 
   private fun onRedirect(uri: Uri) {
-    // Ignore deep links that aren't our Telegram callback.
-    if (redirectHost != null && uri.host != redirectHost) return
+    // Claim ANY `…-login.tg.dev` callback (multiple bots/ERPs) or our custom scheme; ignore other links.
+    val isTelegram = (uri.host?.endsWith("-login.tg.dev") == true) || (uri.scheme != null && uri.scheme == customScheme)
+    if (!isTelegram) return
     val promise = pending ?: return
     pending = null
 
@@ -110,24 +112,45 @@ class OnnoTelegramLoginModule : Module() {
   }
 }
 
-/** Reads the <meta-data> the config plugin writes into the manifest. */
+/**
+ * Resolves the bot config: per-login overrides from JS first (which bot/ERP), then the build-time
+ * <meta-data> defaults the config plugin writes. `redirectUri` defaults to the custom scheme (works
+ * for any bot) when nothing else is provided.
+ */
 private data class TelegramLoginConfig(
   val clientId: String,
   val redirectUri: String,
   val scopes: List<String>,
 ) {
   companion object {
-    fun fromManifest(context: Context): TelegramLoginConfig? {
-      val app = context.packageManager.getApplicationInfo(context.packageName, PackageManager.GET_META_DATA)
-      val meta = app.metaData ?: return null
-      val clientId = meta.getString("TelegramLoginClientId")?.takeIf { it.isNotEmpty() } ?: return null
-      val redirectUri = meta.getString("TelegramLoginRedirectUri")?.takeIf { it.isNotEmpty() } ?: return null
-      val scopes = meta.getString("TelegramLoginScopes")
-        ?.split(",")
-        ?.map { it.trim() }
-        ?.filter { it.isNotEmpty() }
+    @Suppress("UNCHECKED_CAST")
+    fun resolve(context: Context, options: Map<String, Any?>): TelegramLoginConfig? {
+      val meta = try {
+        context.packageManager.getApplicationInfo(context.packageName, PackageManager.GET_META_DATA).metaData
+      } catch (e: Throwable) {
+        null
+      }
+
+      val clientId = (options["clientId"] as? String)?.takeIf { it.isNotEmpty() }
+        ?: meta?.getString("TelegramLoginClientId")?.takeIf { it.isNotEmpty() }
+        ?: return null
+
+      val redirectUri = (options["redirectUri"] as? String)?.takeIf { it.isNotEmpty() }
+        ?: meta?.getString("TelegramLoginRedirectUri")?.takeIf { it.isNotEmpty() }
+        ?: defaultRedirect(meta)
+        ?: return null
+
+      val scopes = (options["scopes"] as? List<String>)?.takeIf { it.isNotEmpty() }
+        ?: meta?.getString("TelegramLoginScopes")?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
         ?: listOf("profile")
+
       return TelegramLoginConfig(clientId, redirectUri, scopes)
+    }
+
+    /** The custom scheme works as a redirect for any bot — a sane fallback when none is configured. */
+    private fun defaultRedirect(meta: android.os.Bundle?): String? {
+      val scheme = meta?.getString("TelegramLoginCustomScheme")?.takeIf { it.isNotEmpty() } ?: return null
+      return "$scheme://tglogin"
     }
   }
 }

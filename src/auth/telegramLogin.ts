@@ -32,8 +32,24 @@ export class TelegramLoginError extends Error {
   }
 }
 
+/** Per-bot overrides passed to the SDK at runtime, so one app can sign in against many bots/ERPs.
+ *  All optional — anything omitted falls back to the build-time default (the config plugin / Info.plist). */
+export interface TelegramLoginOptions {
+  nonce?: string;
+  /** The bot's OIDC client id for this server. */
+  clientId?: string;
+  /** Redirect URI registered for this bot (the app's custom scheme, or a build-registered tg.dev domain). */
+  redirectUri?: string;
+  scopes?: string[];
+}
+
 interface NativeTelegramModule {
-  login(options: { nonce?: string | null }): Promise<{ idToken: string; viaWebFallback?: boolean }>;
+  login(options: {
+    nonce?: string | null;
+    clientId?: string | null;
+    redirectUri?: string | null;
+    scopes?: string[] | null;
+  }): Promise<{ idToken: string; viaWebFallback?: boolean }>;
 }
 
 // `requireOptionalNativeModule` returns null instead of throwing when the module isn't linked,
@@ -46,12 +62,17 @@ export function isTelegramLoginAvailable(): boolean {
 }
 
 /** Run Telegram's official login SDK and resolve to an ID token (+ whether the web fallback was used). */
-export async function telegramLogin(options: { nonce?: string } = {}): Promise<TelegramLoginResult> {
+export async function telegramLogin(options: TelegramLoginOptions = {}): Promise<TelegramLoginResult> {
   if (!native) {
     throw new TelegramLoginError('unavailable', 'The Telegram login module is not available in this build.');
   }
   try {
-    const res = await native.login({ nonce: options.nonce ?? null });
+    const res = await native.login({
+      nonce: options.nonce ?? null,
+      clientId: options.clientId ?? null,
+      redirectUri: options.redirectUri ?? null,
+      scopes: options.scopes ?? null,
+    });
     return { idToken: res.idToken, viaWebFallback: res.viaWebFallback === true };
   } catch (e: any) {
     // Expo native modules reject with an Error whose `code` is the identifier we threw natively.

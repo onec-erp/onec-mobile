@@ -34,18 +34,23 @@ which makes the app fall back to the server's web SSO flow.
 
 ## Enabling it (per deployment)
 
-The config plugin ([`plugins/withTelegramLogin.js`](../../plugins/withTelegramLogin.js)) handles all
-the Info.plist / entitlements / manifest wiring from your bot's **app id** — Telegram hosts the
-redirect at `https://app{appId}-login.tg.dev`. Set it in `app.json`:
+The config plugin ([`plugins/withTelegramLogin.js`](../../plugins/withTelegramLogin.js)) registers the
+build-time redirect mechanisms. **Which bot** signs in is chosen at runtime (the server returns its
+`clientId` from `/api/auth/telegram/native/begin`), so `app.json` only needs:
 
 ```json
 ["./plugins/withTelegramLogin", {
-  "appId": "123456",
-  "clientId": "YOUR_BOT_CLIENT_ID",
-  "scopes": ["profile"],
-  "iosCustomScheme": "onno-telegram"
+  "iosCustomScheme": "onno-telegram",
+  "universalLinkAppIds": [],
+  "defaultClientId": "",
+  "defaultAppId": "",
+  "scopes": ["profile"]
 }]
 ```
+
+The custom scheme works for **any** bot; add bot `appId`s to `universalLinkAppIds` to also register
+their `app{appId}-login.tg.dev` Universal Links / App Links. See the root
+[README](../../README.md#multiple-bots--multiple-erps) for the multi-tenant model.
 
 Then add the SDK to each platform:
 

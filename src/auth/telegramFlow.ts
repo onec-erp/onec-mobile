@@ -7,16 +7,16 @@
 // The dependencies are injected (the real OnnoClient + the real telegramLogin in the app; fakes
 // in tests), so the sequence and its tolerances can be asserted without a device or the SDK.
 
-import type { TelegramNativeUser } from '../api/onnoClient';
-import type { TelegramLoginResult } from './telegramLogin';
+import type { TelegramNativeUser, TelegramBotConfig } from '../api/onnoClient';
+import type { TelegramLoginResult, TelegramLoginOptions } from './telegramLogin';
 
 /** The slice of OnnoClient this flow needs (kept narrow so tests can pass a fake). */
 export interface TelegramFlowClient {
-  telegramNativeBegin(): Promise<{ nonce: string | null }>;
+  telegramNativeBegin(): Promise<{ nonce: string | null } & TelegramBotConfig>;
   telegramNativeLogin(idToken: string): Promise<TelegramNativeUser>;
 }
 
-export type TelegramLoginFn = (options: { nonce?: string }) => Promise<TelegramLoginResult>;
+export type TelegramLoginFn = (options: TelegramLoginOptions) => Promise<TelegramLoginResult>;
 
 export interface TelegramFlowResult {
   user: TelegramNativeUser;
@@ -33,17 +33,24 @@ export async function runTelegramNativeLogin(deps: {
   client: TelegramFlowClient;
   telegramLogin: TelegramLoginFn;
 }): Promise<TelegramFlowResult> {
-  // 1) Ask the server for a one-time nonce (replay protection). Optional.
-  let nonce: string | undefined;
+  // 1) Ask the server for a one-time nonce (replay protection) and, for a multi-tenant app, which bot
+  //    THIS server signs in with (clientId/redirectUri/scopes). All optional — a failure or older
+  //    server just falls back to the build-time default bot.
+  let opts: TelegramLoginOptions = {};
   try {
     const begun = await deps.client.telegramNativeBegin();
-    nonce = begun?.nonce ?? undefined;
+    opts = {
+      nonce: begun?.nonce ?? undefined,
+      clientId: begun?.clientId,
+      redirectUri: begun?.redirectUri,
+      scopes: begun?.scopes,
+    };
   } catch {
-    nonce = undefined;
+    opts = {};
   }
 
-  // 2) Drive Telegram's official login SDK to mint an ID token.
-  const { idToken, viaWebFallback } = await deps.telegramLogin({ nonce });
+  // 2) Drive Telegram's official login SDK to mint an ID token (with this server's bot config).
+  const { idToken, viaWebFallback } = await deps.telegramLogin(opts);
 
   // 3) Exchange the token for a session cookie on the SAME HTTP client, so the cookie persists
   //    across relaunch and authenticates every later /api/** request.

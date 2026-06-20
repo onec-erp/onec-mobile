@@ -58,6 +58,18 @@ export interface TelegramNativeUser {
   name?: string;
 }
 
+/**
+ * Which Telegram bot this server signs in with. Returned (optionally) by `/native/begin` so a single
+ * app can talk to many servers/ERPs, each with its own bot — the values are passed to the SDK at
+ * runtime. `redirectUri` defaults to the app's custom scheme (works for any bot); a `app{appId}-login.tg.dev`
+ * Universal Link only resolves if that domain was registered in the build (see the config plugin).
+ */
+export interface TelegramBotConfig {
+  clientId?: string;
+  redirectUri?: string;
+  scopes?: string[];
+}
+
 export class OnnoAuthError extends Error {
   /** HTTP status that caused it — 401 = bad credentials, 403 = CSRF rejection, etc. Lets
    *  callers distinguish "these creds are wrong" (forget them) from a transient/CSRF failure. */
@@ -258,15 +270,21 @@ export class OnnoClient {
   }
 
   /**
-   * Begin a native Telegram sign-in: `POST /api/auth/telegram/native/begin` → `{ nonce }`. The nonce
-   * is handed to Telegram's login SDK for replay protection. Optional — older servers may not expose
-   * it, so callers tolerate a failure here and proceed without a nonce.
+   * Begin a native Telegram sign-in: `POST /api/auth/telegram/native/begin` → `{ nonce }` plus,
+   * optionally, this server's bot config (`clientId` / `redirectUri` / `scopes`) so one app can sign in
+   * against many servers/ERPs each with their own bot. The nonce is replay protection. Optional — older
+   * servers may not expose it, so callers tolerate a failure here and fall back to the build-time default.
    */
-  async telegramNativeBegin(): Promise<{ nonce: string | null }> {
+  async telegramNativeBegin(): Promise<{ nonce: string | null } & TelegramBotConfig> {
     const res = await this.request('/api/auth/telegram/native/begin', { method: 'POST' });
     if (res.status !== 200) throw new OnnoAuthError(`Telegram begin failed (HTTP ${res.status})`, res.status);
-    const data = (await res.json().catch(() => ({}))) as { nonce?: string | null };
-    return { nonce: data?.nonce ?? null };
+    const data = (await res.json().catch(() => ({}))) as { nonce?: string | null } & TelegramBotConfig;
+    return {
+      nonce: data?.nonce ?? null,
+      clientId: data?.clientId,
+      redirectUri: data?.redirectUri,
+      scopes: Array.isArray(data?.scopes) ? data.scopes.map(String) : undefined,
+    };
   }
 
   /**
