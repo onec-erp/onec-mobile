@@ -3,6 +3,7 @@
     "name": "Onno",
     "slug": "onno",
     "version": "1.0.0",
+    "scheme": "onno",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
@@ -37,16 +38,7 @@
         }
       ],
       "expo-secure-store",
-      [
-        "./plugins/withTelegramLogin",
-        {
-          "iosCustomScheme": "onno-telegram",
-          "universalLinkAppIds": [],
-          "defaultClientId": "",
-          "defaultAppId": "",
-          "scopes": ["profile"]
-        }
-      ]
+      "expo-web-browser"
     ],
     "extra": {
       "eas": {

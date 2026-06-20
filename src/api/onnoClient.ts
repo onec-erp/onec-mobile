@@ -59,15 +59,18 @@ export interface TelegramNativeUser {
 }
 
 /**
- * Which Telegram bot this server signs in with. Returned (optionally) by `/native/begin` so a single
- * app can talk to many servers/ERPs, each with its own bot — the values are passed to the SDK at
- * runtime. `redirectUri` defaults to the app's custom scheme (works for any bot); a `app{appId}-login.tg.dev`
- * Universal Link only resolves if that domain was registered in the build (see the config plugin).
+ * What `POST /api/auth/telegram/native/begin` returns: a replay `nonce` plus the Onno Cloud broker
+ * coordinates the app drives the in-app auth-browser flow with — this server's `clientId` at the
+ * broker (the token `aud`), the requested `scopes`, and the broker's `authorizationUri` / `tokenUri`.
+ * One app can sign in against many servers/ERPs, each pointed at its own broker client. The bot itself
+ * lives only in the cloud, so the app holds no bot config.
  */
-export interface TelegramBotConfig {
+export interface TelegramBrokerBegin {
+  nonce: string | null;
   clientId?: string;
-  redirectUri?: string;
   scopes?: string[];
+  authorizationUri?: string;
+  tokenUri?: string;
 }
 
 export class OnnoAuthError extends Error {
@@ -270,20 +273,21 @@ export class OnnoClient {
   }
 
   /**
-   * Begin a native Telegram sign-in: `POST /api/auth/telegram/native/begin` → `{ nonce }` plus,
-   * optionally, this server's bot config (`clientId` / `redirectUri` / `scopes`) so one app can sign in
-   * against many servers/ERPs each with their own bot. The nonce is replay protection. Optional — older
-   * servers may not expose it, so callers tolerate a failure here and fall back to the build-time default.
+   * Begin a Telegram sign-in: `POST /api/auth/telegram/native/begin` → `{ nonce }` plus the broker
+   * coordinates the app needs (`clientId` / `scopes` / `authorizationUri` / `tokenUri`). The nonce is
+   * replay protection. The app uses these to run the Authorization-Code + PKCE flow against the broker
+   * itself, then posts the resulting id_token to `telegramNativeLogin`.
    */
-  async telegramNativeBegin(): Promise<{ nonce: string | null } & TelegramBotConfig> {
+  async telegramNativeBegin(): Promise<TelegramBrokerBegin> {
     const res = await this.request('/api/auth/telegram/native/begin', { method: 'POST' });
     if (res.status !== 200) throw new OnnoAuthError(`Telegram begin failed (HTTP ${res.status})`, res.status);
-    const data = (await res.json().catch(() => ({}))) as { nonce?: string | null } & TelegramBotConfig;
+    const data = (await res.json().catch(() => ({}))) as any;
     return {
       nonce: data?.nonce ?? null,
-      clientId: data?.clientId,
-      redirectUri: data?.redirectUri,
+      clientId: data?.clientId ?? undefined,
       scopes: Array.isArray(data?.scopes) ? data.scopes.map(String) : undefined,
+      authorizationUri: data?.authorizationUri ?? undefined,
+      tokenUri: data?.tokenUri ?? undefined,
     };
   }
 
