@@ -6,12 +6,13 @@
 // Go-bundled pickers (expo-image-picker / expo-document-picker); no dev build needed.
 
 import React, { useState } from 'react';
-import { ActivityIndicator, Alert, Image, Linking, Text, View } from 'react-native';
+import { ActivityIndicator, Image, Linking, Text, View } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import type { DivHost } from '../types';
 import { colors } from '../theme';
 import { Touchable } from '../../ui/touchable';
+import { alert } from '../../ui/dialog';
 import { LucideIcon } from './lucide';
 
 // Client-side guard mirroring the server's onno.media.max-file-size default (10 MB); the server
@@ -37,7 +38,7 @@ function leafOf(url: string): string {
 async function pickImages(multiple: boolean): Promise<ImagePicker.ImagePickerAsset[]> {
   const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
   if (!perm.granted) {
-    Alert.alert('Permission needed', 'Allow photo-library access to add images.');
+    alert({ title: 'Permission needed', message: 'Allow photo-library access to add images.', tone: 'warning' });
     return [];
   }
   const res = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.8, allowsMultipleSelection: multiple });
@@ -53,14 +54,14 @@ async function pickDocument(): Promise<DocumentPicker.DocumentPickerAsset | null
 // differ slightly between the image and document assets, so callers normalize before this.
 async function upload(host: DivHost, file: { uri: string; name: string; type: string; size?: number }): Promise<string | null> {
   if (file.size != null && file.size > MAX_BYTES) {
-    Alert.alert('Too large', `"${file.name}" exceeds the ${Math.round(MAX_BYTES / 1024 / 1024)} MB limit.`);
+    alert({ title: 'Too large', message: `"${file.name}" exceeds the ${Math.round(MAX_BYTES / 1024 / 1024)} MB limit.`, tone: 'warning' });
     return null;
   }
   try {
     const stored = await host.client.uploadMedia({ uri: file.uri, name: file.name, type: file.type });
     return stored.url;
   } catch (e: any) {
-    Alert.alert('Upload failed', `Couldn't upload "${file.name}": ${String(e?.message ?? e)}`);
+    alert({ title: 'Upload failed', message: `Couldn't upload "${file.name}": ${String(e?.message ?? e)}`, tone: 'error' });
     return null;
   }
 }

@@ -4,10 +4,11 @@
 // { heading, route, profile, buttons: [{ key, label, icon?, logo?, server, url? }] }.
 
 import React, { useState } from 'react';
-import { ActivityIndicator, Alert, Image, Text, View } from 'react-native';
+import { ActivityIndicator, Image, Text, View } from 'react-native';
 import { colors } from '../theme';
 import type { CustomRenderer } from '../types';
 import { Touchable } from '../../ui/touchable';
+import { alert } from '../../ui/dialog';
 import { LucideIcon } from './lucide';
 
 interface ActionButton {
@@ -44,13 +45,13 @@ export const onnoActions: CustomRenderer = ({ customProps, host }) => {
     setPending((s) => ({ ...s, [b.key]: true }));
     try {
       const result = await host.client.runPageAction(route, b.key, profile);
-      if (result.message) Alert.alert('Done', result.message);
+      if (result.message) alert({ title: 'Done', message: result.message, tone: 'success' });
       // A navigate result loads a new surface; otherwise a refresh result reloads this one
       // (the web relies on SSE here — mobile has no live stream, so re-fetch explicitly).
       if (result.navigate) host.fire(result.navigate);
       else if (result.refresh) host.refresh();
     } catch (e: any) {
-      Alert.alert('Action failed', String(e?.message ?? e));
+      alert({ title: 'Action failed', message: String(e?.message ?? e), tone: 'error' });
     } finally {
       setPending((s) => ({ ...s, [b.key]: false }));
     }
