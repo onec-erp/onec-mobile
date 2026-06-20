@@ -21,6 +21,9 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Defs, LinearGradient as SvgLinearGradient, Rect, Stop } from 'react-native-svg';
 import { OnnoAuthError, OnnoClient } from './src/api/onnoClient';
+import { runTelegramNativeLogin } from './src/auth/telegramFlow';
+import { telegramLogin, isTelegramLoginAvailable, TelegramLoginError } from './src/auth/telegramLogin';
+import { resolveSsoTap } from './src/auth/sso';
 import { subscribeUiEvents, affectsSurface, publishUiEvent } from './src/api/events';
 import { toast, Toaster } from './src/ui/toast';
 import { confirm, ConfirmHost } from './src/ui/dialog';
@@ -361,6 +364,37 @@ export default function App() {
     }
   }
 
+  // Native "Login with Telegram": run Telegram's official SDK (no browser round-trip), exchange the
+  // ID token for a session cookie on our HTTP client, then enter the app — same tail as a password
+  // sign-in. Each failure mode is surfaced distinctly: a user cancel is quiet, a 401
+  // telegram_login_failed and a generic SDK error toast, and a build without the module linked falls
+  // back to the server's web SSO flow (so the button always does *something*).
+  async function signInWithTelegram(fallbackHref: string | null) {
+    const client = clientRef.current;
+    if (!client) return;
+    const loadingId = toast.loading('Connecting to Telegram…');
+    try {
+      const { viaWebFallback } = await runTelegramNativeLogin({ client, telegramLogin });
+      toast.dismiss(loadingId);
+      setAuthed(true); // session live → open the SSE stream
+      setStatus('connecting');
+      if (viaWebFallback) toast('Telegram isn’t installed — signed in via the web.');
+      await enterApp(theme);
+    } catch (e) {
+      toast.dismiss(loadingId);
+      if (e instanceof TelegramLoginError && e.code === 'cancelled') {
+        toast('Telegram sign-in cancelled.');
+      } else if (e instanceof TelegramLoginError && e.code === 'unavailable') {
+        // The native module isn't in this build — fall back to the server's web SSO flow.
+        if (fallbackHref) Linking.openURL(fallbackHref).catch(() => toast.error("Couldn't open the sign-in page"));
+      } else if (e instanceof OnnoAuthError && e.status === 401) {
+        toast.error('Telegram sign-in failed. Please try again.');
+      } else {
+        toast.error('Couldn’t sign in with Telegram.');
+      }
+    }
+  }
+
   // Point the app at a server: spin up a fresh client, reset per-server state,
   // leave the picker, persist it as last-used, then connect.
   function connectTo(url: string, th: 'light' | 'dark' = theme) {
@@ -493,18 +527,26 @@ export default function App() {
       return;
     }
     if (rest.startsWith('auth/sso/')) {
-      // An SSO provider button on the server-driven login card. Mirror the web:
-      // redirect to the `?to=` target when it's a same-origin path, else the OIDC
-      // `/oauth2/authorization/{id}` convention. We open it in the system browser;
-      // on return, the foreground re-check (see the AppState effect) signs us in.
+      // An SSO provider button on the server-driven login card. The button renders from the
+      // server's SsoProvider; only the tap handler is platform-specific. Telegram runs the native
+      // SDK (no browser round-trip); every other provider — and web — opens the server's startUrl
+      // in the system browser, where the foreground re-check (see the AppState effect) signs us in.
       const tail = rest.slice('auth/sso/'.length);
       const q = tail.indexOf('?');
       const id = q >= 0 ? tail.slice(0, q) : tail;
       const to = q >= 0 ? new URLSearchParams(tail.slice(q + 1)).get('to') : null;
-      const path = to && to.startsWith('/') ? to : id ? `/oauth2/authorization/${id}` : null;
-      if (path) {
-        const href = `${serverUrl?.replace(/\/$/, '')}${path}`;
-        Linking.openURL(href).catch(() => toast.error("Couldn't open the sign-in page"));
+      const tap = resolveSsoTap({
+        id,
+        to,
+        serverUrl: serverUrl ?? '',
+        platform: Platform.OS,
+        telegramAvailable: isTelegramLoginAvailable(),
+      });
+      if (!tap) return;
+      if (tap.kind === 'telegram-native') {
+        signInWithTelegram(tap.fallbackHref);
+      } else {
+        Linking.openURL(tap.href).catch(() => toast.error("Couldn't open the sign-in page"));
       }
       return;
     }

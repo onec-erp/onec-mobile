@@ -36,7 +36,14 @@
           "photosPermission": "Allow $(PRODUCT_NAME) to access your photos to attach images to records."
         }
       ],
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "./plugins/withTelegramLogin",
+        {
+          "scheme": "onno-telegram",
+          "callbackHost": "telegram-login"
+        }
+      ]
     ],
     "extra": {
       "eas": {
