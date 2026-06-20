@@ -30,11 +30,16 @@ android {
 }
 
 dependencies {
-  // Telegram's official Android login SDK — TelegramMessenger/telegram-login-android.
-  // Replace with the coordinate/version you've registered with @BotFather (or vendor the
-  // .aar under android/libs and depend on it via fileTree).
+  // Telegram's official Android login SDK — TelegramMessenger/telegram-login-android. It's published
+  // to GitHub Packages, which requires a personal access token, so it can't be an unconditional
+  // dependency of this repo. To enable it:
+  //   1. Add the GitHub Packages maven repo (with gpr.user / gpr.key credentials) to your app's
+  //      android/settings.gradle — see modules/onno-telegram-login/README.md.
+  //   2. Uncomment the line below.
+  // The Kotlin bridge binds to the SDK via a reflection shim, so it compiles and the app builds with
+  // this commented out (the module then reports "unavailable" and the app uses the web SSO flow).
   //
-  //   implementation 'org.telegram:login:<version>'
+  //   implementation 'org.telegram:login-sdk:1.0.0'
 
   implementation 'androidx.browser:browser:1.8.0' // Custom Tabs fallback when Telegram isn't installed
 }

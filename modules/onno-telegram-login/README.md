@@ -3,8 +3,8 @@
 Native **Login with Telegram** for the Onno mobile client. Wraps Telegram's official login SDKs so
 the server-contributed Telegram SSO button works natively — no browser/WebView round-trip:
 
-- iOS — [TelegramMessenger/telegram-login-ios](https://github.com/TelegramMessenger/telegram-login-ios)
-- Android — [TelegramMessenger/telegram-login-android](https://github.com/TelegramMessenger/telegram-login-android)
+- iOS — [TelegramMessenger/telegram-login-ios](https://github.com/TelegramMessenger/telegram-login-ios) (Swift Package Manager)
+- Android — [TelegramMessenger/telegram-login-android](https://github.com/TelegramMessenger/telegram-login-android) (GitHub Packages: `org.telegram:login-sdk`)
 
 It exposes one JS method, `login({ nonce? }) → { idToken, viaWebFallback }`, consumed by
 [`src/auth/telegramLogin.ts`](../../src/auth/telegramLogin.ts). Because the app loads the module with
@@ -13,33 +13,67 @@ web, Jest), and the SSO button falls back to the server's web flow.
 
 > Requires a **dev client / standalone build** (`expo-dev-client`). It does not run in Expo Go.
 
-## Files
+## What's implemented
+
+The bridges are wired to the real SDKs (not stubs):
 
 | Path | Purpose |
 | --- | --- |
 | `index.ts` | `requireNativeModule('OnnoTelegramLogin')` + types |
-| `expo-module.config.json` | registers the native modules for autolinking |
-| `ios/OnnoTelegramLoginModule.swift` | iOS bridge — wire the iOS SDK here (`TODO(native)`) |
-| `ios/OnnoTelegramLogin.podspec` | adds `ExpoModulesCore` + the Telegram pod |
-| `android/.../OnnoTelegramLoginModule.kt` | Android bridge — wire the Android SDK here (`TODO(native)`) |
-| `android/build.gradle` | adds the Telegram SDK + Custom Tabs dep |
+| `expo-module.config.json` | registers the native module + the iOS AppDelegate subscriber |
+| `ios/OnnoTelegramLoginModule.swift` | `TelegramLogin.configure(...)` + `TelegramLogin.login { … }`, reads config from Info.plist |
+| `ios/OnnoTelegramLoginAppDelegate.swift` | forwards the Universal-Link / custom-scheme callback to `TelegramLogin.handle(_:)` |
+| `ios/OnnoTelegramLogin.podspec` | `ExpoModulesCore` dep (the SDK itself is added via SPM) |
+| `android/.../OnnoTelegramLoginModule.kt` | `init` / `startLogin` / `handleLoginResponse`, reads config from manifest `<meta-data>`, completes on `OnNewIntent` |
+| `android/build.gradle` | Custom Tabs dep + the (commented) Telegram SDK coordinate |
 | `android/src/main/AndroidManifest.xml` | `<queries>` so the SDK can see/launch Telegram |
 
-## Wiring the SDK (the `TODO(native)` blocks)
+Both sides keep building **with or without** the SDK linked: iOS via `#if canImport(TelegramLogin)`,
+Android via a small reflection shim. Until the SDK is added they reject `ERR_TELEGRAM_UNAVAILABLE`,
+which makes the app fall back to the server's web SSO flow.
 
-1. **Add the SDK dependency** — uncomment the `s.dependency 'TelegramLogin'` line in the podspec
-   (or add the Swift Package to the dev client) and the `implementation 'org.telegram:login:…'` line
-   in `build.gradle`, pinned to the version registered with @BotFather.
-2. **Implement the bridge** — replace the `TODO(native)` block in each module file with the real SDK
-   call, honoring the promise contract:
-   - resolve `{ idToken, viaWebFallback }`
-   - reject `ERR_TELEGRAM_CANCELLED` on user cancel
-   - reject `ERR_TELEGRAM_FAILED` on any other error
-   Until then the bridge rejects `ERR_TELEGRAM_UNAVAILABLE`, which makes the app fall back to the
-   server's web SSO flow.
-3. **Pass the same bot** used by the web flow, and the `nonce` argument (replay protection).
+## Enabling it (per deployment)
 
-The redirect callback (Universal Link / app link / custom scheme `onno-telegram://telegram-login`)
-and the platform allow-lists are configured by the Expo config plugin
-[`plugins/withTelegramLogin.js`](../../plugins/withTelegramLogin.js). See the root
-[`README.md`](../../README.md#login-with-telegram-native-sso) for the @BotFather registration steps.
+The config plugin ([`plugins/withTelegramLogin.js`](../../plugins/withTelegramLogin.js)) handles all
+the Info.plist / entitlements / manifest wiring from your bot's **app id** — Telegram hosts the
+redirect at `https://app{appId}-login.tg.dev`. Set it in `app.json`:
+
+```json
+["./plugins/withTelegramLogin", {
+  "appId": "123456",
+  "clientId": "YOUR_BOT_CLIENT_ID",
+  "scopes": ["profile"],
+  "iosCustomScheme": "onno-telegram"
+}]
+```
+
+Then add the SDK to each platform:
+
+**iOS** — in Xcode, *File → Add Package Dependencies…* →
+`https://github.com/TelegramMessenger/telegram-login-ios`, add it to the app target. (During
+development you can append `?mode=developer` to the associated domain to bypass caching.)
+
+**Android** — add the GitHub Packages repo to your app's `android/settings.gradle` and uncomment the
+dependency in `android/build.gradle`:
+
+```kotlin
+// android/settings.gradle → dependencyResolutionManagement { repositories { … } }
+maven {
+  url = uri("https://maven.pkg.github.com/TelegramMessenger/telegram-login-android")
+  credentials {
+    username = providers.gradleProperty("gpr.user").orNull ?: System.getenv("GITHUB_USERNAME")
+    password = providers.gradleProperty("gpr.key").orNull ?: System.getenv("GITHUB_TOKEN")
+  }
+}
+```
+
+```groovy
+// modules/onno-telegram-login/android/build.gradle
+implementation 'org.telegram:login-sdk:1.0.0'
+```
+
+(The GitHub token is a build-time credential — it never ships in the app.)
+
+Finally rebuild the dev client (`npm run ios` / `npm run android`) — native/config-plugin changes need
+a rebuild, not just a Metro reload. See the root [`README.md`](../../README.md#login-with-telegram-native-sso)
+for the @BotFather registration steps.

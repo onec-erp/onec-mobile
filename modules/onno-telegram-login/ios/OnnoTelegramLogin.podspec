@@ -17,12 +17,10 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
 
-  # Telegram's official iOS login SDK — TelegramMessenger/telegram-login-ios.
-  # Pin to the version you've registered with @BotFather. If the SDK is distributed
-  # as a Swift Package rather than a CocoaPod, add it to the dev-client's Podfile /
-  # SPM config instead and remove this line.
-  #
-  #   s.dependency 'TelegramLogin'
+  # Telegram's official iOS login SDK is distributed via Swift Package Manager, not CocoaPods:
+  #   https://github.com/TelegramMessenger/telegram-login-ios
+  # Add it to the app target in Xcode (File > Add Packages…) — the Swift sources here compile with
+  # or without it thanks to `#if canImport(TelegramLogin)`, falling back to the web flow until linked.
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',

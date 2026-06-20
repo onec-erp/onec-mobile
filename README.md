@@ -34,8 +34,8 @@ hardcoded button.
 
 | Layer | File |
 | --- | --- |
-| Native module (iOS/Android bridge to the official SDKs) | [`modules/onno-telegram-login/`](modules/onno-telegram-login/) |
-| Expo config plugin (Info.plist / AndroidManifest wiring) | [`plugins/withTelegramLogin.js`](plugins/withTelegramLogin.js) |
+| Native module (iOS/Android bridges, wired to the official SDKs) | [`modules/onno-telegram-login/`](modules/onno-telegram-login/) |
+| Expo config plugin (Info.plist / entitlements / manifest wiring) | [`plugins/withTelegramLogin.js`](plugins/withTelegramLogin.js) |
 | JS wrapper (optional native binding + typed errors) | [`src/auth/telegramLogin.ts`](src/auth/telegramLogin.ts) |
 | Flow orchestration (begin → SDK → exchange) | [`src/auth/telegramFlow.ts`](src/auth/telegramFlow.ts) |
 | Tap-handler branch (native vs. web) | [`src/auth/sso.ts`](src/auth/sso.ts) + `onAction`/`signInWithTelegram` in [`App.tsx`](App.tsx) |
@@ -78,40 +78,43 @@ Widget**, and register the native apps:
   keytool -list -v -keystore <your.keystore> -alias <alias> | grep SHA256
   ```
 
-No secrets live in the app — the bot token and signing secrets stay with @BotFather and the server.
+Telegram then gives you an **app id** and a **client id**. The app id forms the hosted redirect domain
+`app{appId}-login.tg.dev` (no AASA/asset-links hosting needed on your side — Telegram hosts it). No
+secrets live in the app; the bot token and signing secrets stay with @BotFather and the server.
 
-#### 2. Wire the official SDKs (the `TODO(native)` blocks)
+#### 2. Configure the plugin
 
-The native bridges are scaffolded with the Expo Modules API and a clear promise contract, but the
-actual SDK calls are marked `TODO(native)` (they reject `ERR_TELEGRAM_UNAVAILABLE` until wired, which
-makes the app fall back to the web flow). To finish:
-
-- iOS — add [`telegram-login-ios`](https://github.com/TelegramMessenger/telegram-login-ios) (pod or
-  SPM) and implement `modules/onno-telegram-login/ios/OnnoTelegramLoginModule.swift`.
-- Android — add [`telegram-login-android`](https://github.com/TelegramMessenger/telegram-login-android)
-  and implement `modules/onno-telegram-login/android/.../OnnoTelegramLoginModule.kt`.
-
-See [`modules/onno-telegram-login/README.md`](modules/onno-telegram-login/README.md) for the contract.
-
-#### 3. Callback redirect
-
-The config plugin registers the callback so the SDK's web-auth fallback can return:
-
-- iOS — custom URL scheme `onno-telegram://telegram-login` (`CFBundleURLTypes`) and `tg`/`tgapi` in
-  `LSApplicationQueriesSchemes`. For a **Universal Link** instead, pass `associatedDomain` to the
-  plugin in `app.json` and host the AASA on that domain.
-- Android — a `VIEW` intent-filter on `MainActivity` for the same scheme/host; Telegram package
-  visibility (`<queries>`) ships in the module's manifest.
-
-The callback URL must match what you register with @BotFather / the server. Configure it in
-`app.json`:
+Set the ids in `app.json` (leave empty to keep the web flow):
 
 ```json
-["./plugins/withTelegramLogin", { "scheme": "onno-telegram", "callbackHost": "telegram-login" }]
+["./plugins/withTelegramLogin", {
+  "appId": "123456",
+  "clientId": "YOUR_BOT_CLIENT_ID",
+  "scopes": ["profile"],
+  "iosCustomScheme": "onno-telegram"
+}]
 ```
 
-Then rebuild the dev client (`npm run ios` / `npm run android`) — config-plugin changes need a native
-rebuild, not just a Metro reload.
+The plugin writes the SDK config (client id, `https://app{appId}-login.tg.dev` redirect, scopes) into
+Info.plist / manifest `<meta-data>`, adds the iOS Associated Domain + Android verified app-link
+intent-filter for the callback, and allow-lists `tg` in `LSApplicationQueriesSchemes`. The native
+bridges read that config and drive the SDK — the callback is delivered automatically (iOS AppDelegate
+subscriber → `TelegramLogin.handle`, Android `OnNewIntent` → `handleLoginResponse`).
+
+#### 3. Add the SDK to each platform
+
+The bridges are implemented but compile/run **with or without** the SDK linked (falling back to the
+web flow until it's present). To turn it on:
+
+- **iOS** — Xcode → *File → Add Package Dependencies…* →
+  `https://github.com/TelegramMessenger/telegram-login-ios`, add to the app target.
+- **Android** — add the GitHub Packages maven repo (with a `gpr.user`/`gpr.key` token) to
+  `android/settings.gradle` and uncomment `implementation 'org.telegram:login-sdk:1.0.0'` in
+  `modules/onno-telegram-login/android/build.gradle`.
+
+Full snippets in [`modules/onno-telegram-login/README.md`](modules/onno-telegram-login/README.md).
+Then rebuild the dev client (`npm run ios` / `npm run android`) — native/config-plugin changes need a
+native rebuild, not just a Metro reload.
 
 ### Tests
 

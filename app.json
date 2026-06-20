@@ -40,8 +40,10 @@
       [
         "./plugins/withTelegramLogin",
         {
-          "scheme": "onno-telegram",
-          "callbackHost": "telegram-login"
+          "appId": "",
+          "clientId": "",
+          "scopes": ["profile"],
+          "iosCustomScheme": "onno-telegram"
         }
       ]
     ],
