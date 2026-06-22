@@ -11,6 +11,7 @@ import { onnoGeo } from './geo';
 import { onnoHint, onnoIcon } from './icon';
 import { onnoList } from './list';
 import { onnoLoginForm } from './loginForm';
+import { onnoSsoIcon } from './ssoIcon';
 import { onnoWidget } from './widget';
 
 registerCustom('onno-icon', onnoIcon);
@@ -23,4 +24,5 @@ registerCustom('onno-form', onnoForm);
 registerCustom('onno-comments', onnoComments);
 registerCustom('onno-constants', onnoConstants);
 registerCustom('onno-login-form', onnoLoginForm);
+registerCustom('onno-sso-icon', onnoSsoIcon);
 registerCustom('onno-geo', onnoGeo);
