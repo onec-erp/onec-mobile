@@ -4,11 +4,12 @@
 // constants-editor.tsx. custom_props: { title, names?: string[] }.
 
 import React, { useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, Alert, Switch, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Switch, Text, TextInput, View } from 'react-native';
 import type { Row, SettingMeta } from '../../api/onnoClient';
 import { colors } from '../theme';
 import type { CustomRenderer, DivHost } from '../types';
 import { Touchable } from '../../ui/touchable';
+import { alert } from '../../ui/dialog';
 
 const isBool = (t: string) => /^(boolean|Boolean)$/.test(t);
 const isNum = (t: string) => /^(Integer|Long|Double|Float|Short|BigDecimal|int|long|double)$/.test(t);
@@ -68,10 +69,10 @@ function ConstantsEditor({ host, title, names }: { host: DivHost; title?: string
     setSaving(true);
     try {
       await host.client.saveSettings(values);
-      Alert.alert('Saved', 'Settings saved');
+      alert({ title: 'Saved', message: 'Settings saved', tone: 'success' });
       setDirty(false);
     } catch (e: any) {
-      Alert.alert("Couldn't save settings", String(e?.message ?? e));
+      alert({ title: "Couldn't save settings", message: String(e?.message ?? e), tone: 'error' });
     } finally {
       setSaving(false);
     }

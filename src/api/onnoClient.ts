@@ -51,6 +51,28 @@ export interface UploadFile {
   type: string;
 }
 
+/** The profile `POST /api/auth/telegram/native` returns on a successful native Telegram sign-in. */
+export interface TelegramNativeUser {
+  id: string;
+  username?: string;
+  name?: string;
+}
+
+/**
+ * What `POST /api/auth/telegram/native/begin` returns: a replay `nonce` plus the Onno Cloud broker
+ * coordinates the app drives the in-app auth-browser flow with — this server's `clientId` at the
+ * broker (the token `aud`), the requested `scopes`, and the broker's `authorizationUri` / `tokenUri`.
+ * One app can sign in against many servers/ERPs, each pointed at its own broker client. The bot itself
+ * lives only in the cloud, so the app holds no bot config.
+ */
+export interface TelegramBrokerBegin {
+  nonce: string | null;
+  clientId?: string;
+  scopes?: string[];
+  authorizationUri?: string;
+  tokenUri?: string;
+}
+
 export class OnnoAuthError extends Error {
   /** HTTP status that caused it — 401 = bad credentials, 403 = CSRF rejection, etc. Lets
    *  callers distinguish "these creds are wrong" (forget them) from a transient/CSRF failure. */
@@ -248,6 +270,50 @@ export class OnnoClient {
     // it means the app couldn't read/echo the XSRF-TOKEN cookie for this server.
     if (res.status === 403) throw new OnnoAuthError('Security check failed (CSRF, HTTP 403) — the app couldn’t read this server’s XSRF-TOKEN cookie.', 403);
     throw new OnnoAuthError(`Login failed (HTTP ${res.status})`, res.status);
+  }
+
+  /**
+   * Begin a Telegram sign-in: `POST /api/auth/telegram/native/begin` → `{ nonce }` plus the broker
+   * coordinates the app needs (`clientId` / `scopes` / `authorizationUri` / `tokenUri`). The nonce is
+   * replay protection. The app uses these to run the Authorization-Code + PKCE flow against the broker
+   * itself, then posts the resulting id_token to `telegramNativeLogin`.
+   */
+  async telegramNativeBegin(): Promise<TelegramBrokerBegin> {
+    const res = await this.request('/api/auth/telegram/native/begin', { method: 'POST' });
+    if (res.status !== 200) throw new OnnoAuthError(`Telegram begin failed (HTTP ${res.status})`, res.status);
+    const data = (await res.json().catch(() => ({}))) as any;
+    return {
+      nonce: data?.nonce ?? null,
+      clientId: data?.clientId ?? undefined,
+      scopes: Array.isArray(data?.scopes) ? data.scopes.map(String) : undefined,
+      authorizationUri: data?.authorizationUri ?? undefined,
+      tokenUri: data?.tokenUri ?? undefined,
+    };
+  }
+
+  /**
+   * Complete a native Telegram sign-in: `POST /api/auth/telegram/native` with the SDK's `{ idToken }`.
+   * On success (200) the response carries `{ id, username, name }` AND a Set-Cookie session that lands
+   * in the shared cookie jar — so every later `/api/**` request via this client is authenticated. A 401
+   * means the token was rejected; we surface the server's `error` code (`telegram_login_failed`).
+   */
+  async telegramNativeLogin(idToken: string): Promise<TelegramNativeUser> {
+    const res = await this.request('/api/auth/telegram/native', { method: 'POST', body: { idToken } });
+    if (res.status === 200) {
+      const j = (await res.json().catch(() => ({}))) as any;
+      return { id: String(j?.id ?? ''), username: j?.username ?? undefined, name: j?.name ?? undefined };
+    }
+    if (res.status === 401) {
+      let code = 'telegram_login_failed';
+      try {
+        const j = (await res.json()) as { error?: string };
+        if (j?.error) code = String(j.error);
+      } catch {
+        /* non-JSON body — keep the default code */
+      }
+      throw new OnnoAuthError(code, 401);
+    }
+    throw new OnnoAuthError(`Telegram login failed (HTTP ${res.status})`, res.status);
   }
 
   async logout(): Promise<void> {

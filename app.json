@@ -3,6 +3,7 @@
     "name": "Onno",
     "slug": "onno",
     "version": "1.0.0",
+    "scheme": "onno",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
@@ -36,7 +37,8 @@
           "photosPermission": "Allow $(PRODUCT_NAME) to access your photos to attach images to records."
         }
       ],
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-web-browser"
     ],
     "extra": {
       "eas": {
